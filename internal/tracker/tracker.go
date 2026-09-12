@@ -124,6 +124,8 @@ func (t *Tracker) emitAttentionLatency(al AttentionLatency) {
 }
 
 // ApplyWorkspaceCreated folds a workspace.created event into the tracked state.
+// Idempotent (2.5): a duplicate event overwrites the same map key with
+// identical data (aside from UpdatedAt, which is benign).
 func (t *Tracker) ApplyWorkspaceCreated(ev events.NormalizedEvent) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -132,6 +134,7 @@ func (t *Tracker) ApplyWorkspaceCreated(ev events.NormalizedEvent) {
 
 // ApplyWorkspaceClosed removes a workspace and cascades its tabs and panes —
 // their own close events may not arrive.
+// Idempotent (2.5): deleting already-missing keys is a no-op.
 func (t *Tracker) ApplyWorkspaceClosed(ev events.NormalizedEvent) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -150,6 +153,7 @@ func (t *Tracker) ApplyWorkspaceClosed(ev events.NormalizedEvent) {
 
 // ApplyPaneCreated records a pane and seeds tab membership. No tab events
 // exist (0.2), so pane.created is the only event that can seed a tab.
+// Idempotent (2.5): duplicate event overwrites the same map keys harmlessly.
 func (t *Tracker) ApplyPaneCreated(ev events.NormalizedEvent) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -167,6 +171,7 @@ func (t *Tracker) ApplyPaneCreated(ev events.NormalizedEvent) {
 // ApplyPaneClosed removes a pane. If its agent was still `done`, the
 // attention-latency interval is flushed rather than silently dropped — the
 // pane may close while unseen (2.7's flush-on-close).
+// Idempotent (2.5): deleting an already-missing key is a no-op.
 func (t *Tracker) ApplyPaneClosed(ev events.NormalizedEvent) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -185,6 +190,7 @@ func (t *Tracker) ApplyPaneClosed(ev events.NormalizedEvent) {
 }
 
 // ApplyAgentDetected records which agent holds a pane.
+// Idempotent (2.5): duplicate event sets the same agent string.
 func (t *Tracker) ApplyAgentDetected(ev events.NormalizedEvent) {
 	t.mu.Lock()
 	defer t.mu.Unlock()

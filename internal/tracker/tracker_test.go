@@ -10,6 +10,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sync"
 	"testing"
 	"time"
@@ -352,6 +353,164 @@ func TestApplyPaneClosedForeignNoLatency(t *testing.T) {
 	case al := <-tr.AttentionLatency():
 		t.Errorf("closing a non-done pane emitted a sample: %+v", al)
 	default:
+	}
+}
+
+// TestIdempotentApplySameEventSequence verifies that applying the full event
+// lifecycle twice produces identical tracked state — the core 2.5 contract.
+// Events carry no sequence number (0.4), so idempotent application is the
+// only dedup mechanism.
+func TestIdempotentApplySameEventSequence(t *testing.T) {
+	cur := time.Date(2026, 9, 11, 12, 0, 0, 0, time.UTC)
+	tr := NewTracker()
+	tr.now = func() time.Time { return cur }
+
+	seq := []events.NormalizedEvent{
+		{WorkspaceID: "w1"},
+		{PaneID: "w1:p1", WorkspaceID: "w1", TabID: "w1:t1"},
+		{PaneID: "w1:p1", Agent: "codex"},
+		{PaneID: "w1:p1", WorkspaceID: "w1", Agent: "codex", NewState: snapshot.AgentStatusWorking},
+	}
+
+	// First pass: build up state.
+	tr.ApplyWorkspaceCreated(seq[0])
+	tr.ApplyPaneCreated(seq[1])
+	tr.ApplyAgentDetected(seq[2])
+	tr.ApplyAgentStatusChanged(seq[3])
+	cur = cur.Add(2 * time.Minute)
+	tr.ApplyAgentStatusChanged(events.NormalizedEvent{PaneID: "w1:p1", WorkspaceID: "w1", Agent: "codex", NewState: snapshot.AgentStatusBlocked})
+
+	tr.mu.RLock()
+	snap1 := captureTrackerState(t, tr)
+	tr.mu.RUnlock()
+
+	// Second pass: apply the same events again (simulate a duplicate delivery).
+	tr.ApplyWorkspaceCreated(seq[0])
+	tr.ApplyPaneCreated(seq[1])
+	tr.ApplyAgentDetected(seq[2])
+	// Duplicate status transitions — must be no-ops.
+	tr.ApplyAgentStatusChanged(seq[3])
+	tr.ApplyAgentStatusChanged(events.NormalizedEvent{PaneID: "w1:p1", WorkspaceID: "w1", Agent: "codex", NewState: snapshot.AgentStatusBlocked})
+
+	tr.mu.RLock()
+	snap2 := captureTrackerState(t, tr)
+	tr.mu.RUnlock()
+
+	drainAttentionLatency(t, tr)
+
+	if !reflect.DeepEqual(snap1, snap2) {
+		t.Errorf("state diverged after duplicate event sequence:\n  first:  %+v\n  second: %+v", snap1, snap2)
+	}
+}
+
+// capturedState is a test helper that captures tracked state as a comparable struct.
+type capturedState struct {
+	Workspaces map[string]WorkspaceState
+	Panes      map[string]PaneState
+	Tabs       map[string]TabState
+	Agents     map[string]AgentState
+}
+
+func captureTrackerState(t *testing.T, tr *Tracker) capturedState {
+	t.Helper()
+	ws := cloneWorkspaces(tr.workspaces)
+	for k, v := range ws {
+		v.UpdatedAt = time.Time{}
+		ws[k] = v
+	}
+	panes := clonePanes(tr.panes)
+	for k, v := range panes {
+		v.UpdatedAt = time.Time{}
+		panes[k] = v
+	}
+	tabs := cloneTabs(tr.tabs)
+	for k, v := range tabs {
+		v.UpdatedAt = time.Time{}
+		tabs[k] = v
+	}
+	return capturedState{
+		Workspaces: ws,
+		Panes:      panes,
+		Tabs:       tabs,
+		Agents:     cloneAgents(tr.agents),
+	}
+}
+
+func cloneWorkspaces(m map[string]WorkspaceState) map[string]WorkspaceState {
+	out := make(map[string]WorkspaceState, len(m))
+	for k, v := range m {
+		out[k] = v
+	}
+	return out
+}
+
+func clonePanes(m map[string]PaneState) map[string]PaneState {
+	out := make(map[string]PaneState, len(m))
+	for k, v := range m {
+		out[k] = v
+	}
+	return out
+}
+
+func cloneTabs(m map[string]TabState) map[string]TabState {
+	out := make(map[string]TabState, len(m))
+	for k, v := range m {
+		out[k] = v
+	}
+	return out
+}
+
+func cloneAgents(m map[string]AgentState) map[string]AgentState {
+	out := make(map[string]AgentState, len(m))
+	for k, v := range m {
+		out[k] = v
+	}
+	return out
+}
+
+func drainAttentionLatency(t *testing.T, tr *Tracker) {
+	t.Helper()
+	for {
+		select {
+		case <-tr.AttentionLatency():
+		default:
+			return
+		}
+	}
+}
+
+// TestApplyPaneCreatedDuplicateIsBenign verifies that a duplicate pane.created
+// event overwrites the same map key with harmless results — the only field
+// that changes is UpdatedAt, which is expected.
+func TestApplyPaneCreatedDuplicateIsBenign(t *testing.T) {
+	cur := time.Date(2026, 9, 11, 12, 0, 0, 0, time.UTC)
+	tr := NewTracker()
+	tr.now = func() time.Time { return cur }
+
+	ev := events.NormalizedEvent{PaneID: "w1:p1", WorkspaceID: "w1", TabID: "w1:t1"}
+	tr.ApplyPaneCreated(ev)
+
+	tr.mu.RLock()
+	first := tr.panes["w1:p1"]
+	firstTab := tr.tabs["w1:t1"]
+	tr.mu.RUnlock()
+
+	cur = cur.Add(time.Minute)
+	tr.ApplyPaneCreated(ev) // duplicate
+
+	tr.mu.RLock()
+	second := tr.panes["w1:p1"]
+	secondTab := tr.tabs["w1:t1"]
+	tr.mu.RUnlock()
+
+	if first.PaneID != second.PaneID || first.WorkspaceID != second.WorkspaceID || first.TabID != second.TabID {
+		t.Errorf("pane struct changed on duplicate: first=%+v, second=%+v", first, second)
+	}
+	if firstTab.TabID != secondTab.TabID || firstTab.WorkspaceID != secondTab.WorkspaceID {
+		t.Errorf("tab struct changed on duplicate: first=%+v, second=%+v", firstTab, secondTab)
+	}
+	if !second.UpdatedAt.After(first.UpdatedAt) {
+		t.Error("UpdatedAt not refreshed on duplicate (expected benign update)")
 	}
 }
 
