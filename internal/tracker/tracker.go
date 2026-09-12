@@ -88,6 +88,12 @@ type Tracker struct {
 	panes      map[string]PaneState
 	agents     map[string]AgentState
 
+	// stateCounts and workspaceStateCounts maintain the live per-state agent
+	// counts (2.6), updated incrementally on every transition and recomputed
+	// wholesale by ApplySnapshot. Phase 3.6/3.7 read them via Counts().
+	stateCounts          map[snapshot.AgentStatus]int
+	workspaceStateCounts map[string]map[snapshot.AgentStatus]int
+
 	// attentionLatency surfaces closed done-intervals. Non-blocking send with
 	// drop-and-warn on backpressure, matching Subscriber's events channel
 	// idiom.
@@ -101,12 +107,14 @@ type Tracker struct {
 
 func NewTracker() *Tracker {
 	return &Tracker{
-		workspaces:       map[string]WorkspaceState{},
-		tabs:             map[string]TabState{},
-		panes:            map[string]PaneState{},
-		agents:           map[string]AgentState{},
-		attentionLatency: make(chan AttentionLatency, 64),
-		now:              time.Now,
+		workspaces:           map[string]WorkspaceState{},
+		tabs:                 map[string]TabState{},
+		panes:                map[string]PaneState{},
+		agents:               map[string]AgentState{},
+		attentionLatency:     make(chan AttentionLatency, 64),
+		now:                  time.Now,
+		stateCounts:          map[snapshot.AgentStatus]int{},
+		workspaceStateCounts: map[string]map[snapshot.AgentStatus]int{},
 	}
 }
 
@@ -132,8 +140,10 @@ func (t *Tracker) ApplyWorkspaceCreated(ev events.NormalizedEvent) {
 	t.workspaces[ev.WorkspaceID] = WorkspaceState{WorkspaceID: ev.WorkspaceID, UpdatedAt: t.now()}
 }
 
-// ApplyWorkspaceClosed removes a workspace and cascades its tabs and panes —
-// their own close events may not arrive.
+// ApplyWorkspaceClosed removes a workspace and cascades its tabs, panes, and
+// agents — their own close events may not arrive. Agents must not be skipped:
+// an agent keyed to a deleted pane would otherwise linger (and leak its state
+// count) until the next re-baseline.
 // Idempotent (2.5): deleting already-missing keys is a no-op.
 func (t *Tracker) ApplyWorkspaceClosed(ev events.NormalizedEvent) {
 	t.mu.Lock()
@@ -147,6 +157,12 @@ func (t *Tracker) ApplyWorkspaceClosed(ev events.NormalizedEvent) {
 	for id, pane := range t.panes {
 		if pane.WorkspaceID == ev.WorkspaceID {
 			delete(t.panes, id)
+		}
+	}
+	for id, ag := range t.agents {
+		if ag.WorkspaceID == ev.WorkspaceID {
+			t.decrStateLocked(ag.WorkspaceID, ag.Status)
+			delete(t.agents, id)
 		}
 	}
 }
@@ -176,14 +192,18 @@ func (t *Tracker) ApplyPaneClosed(ev events.NormalizedEvent) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	now := t.now()
-	if ag, ok := t.agents[ev.PaneID]; ok && ag.Status == snapshot.AgentStatusDone {
-		t.emitAttentionLatency(AttentionLatency{
-			PaneID:      ag.PaneID,
-			WorkspaceID: ag.WorkspaceID,
-			Agent:       ag.AgentType,
-			Duration:    now.Sub(ag.AttentionStartedAt),
-			ObservedAt:  now,
-		})
+	ag, ok := t.agents[ev.PaneID]
+	if ok {
+		if ag.Status == snapshot.AgentStatusDone {
+			t.emitAttentionLatency(AttentionLatency{
+				PaneID:      ag.PaneID,
+				WorkspaceID: ag.WorkspaceID,
+				Agent:       ag.AgentType,
+				Duration:    now.Sub(ag.AttentionStartedAt),
+				ObservedAt:  now,
+			})
+		}
+		t.decrStateLocked(ag.WorkspaceID, ag.Status)
 	}
 	delete(t.agents, ev.PaneID)
 	delete(t.panes, ev.PaneID)
@@ -240,6 +260,7 @@ func (t *Tracker) ApplyAgentStatusChanged(ev events.NormalizedEvent) {
 			state.AttentionStartedAt = now
 		}
 		t.agents[ev.PaneID] = state
+		t.incrStateLocked(state.WorkspaceID, state.Status)
 		return
 	}
 
@@ -248,10 +269,12 @@ func (t *Tracker) ApplyAgentStatusChanged(ev events.NormalizedEvent) {
 	}
 
 	prevStatus := ag.Status
+	t.decrStateLocked(ag.WorkspaceID, prevStatus)
 	ag.DurationByState[prevStatus] += now.Sub(ag.StateEnteredAt)
 	ag.Status = ev.NewState
 	ag.StateEnteredAt = now
 	ag.WorkspaceID = ev.WorkspaceID
+	t.incrStateLocked(ag.WorkspaceID, ev.NewState)
 	if ev.Agent != "" {
 		ag.AgentType = ev.Agent
 	}
@@ -289,6 +312,7 @@ func (t *Tracker) ApplySeenFlip(paneID string) {
 		return
 	}
 
+	t.decrStateLocked(ag.WorkspaceID, snapshot.AgentStatusDone)
 	ag.DurationByState[ag.Status] += now.Sub(ag.StateEnteredAt)
 	t.emitAttentionLatency(AttentionLatency{
 		PaneID:      ag.PaneID,
@@ -300,6 +324,7 @@ func (t *Tracker) ApplySeenFlip(paneID string) {
 	ag.Status = snapshot.AgentStatusIdle
 	ag.StateEnteredAt = now
 	ag.AttentionStartedAt = time.Time{}
+	t.incrStateLocked(ag.WorkspaceID, snapshot.AgentStatusIdle)
 	t.agents[paneID] = ag
 
 	if pane, ok := t.panes[paneID]; ok {
@@ -338,6 +363,7 @@ func (t *Tracker) ApplySnapshot(snap snapshot.Snapshot) {
 	clear(t.tabs)
 	clear(t.panes)
 	clear(t.agents)
+	t.resetCountsLocked()
 
 	for _, ws := range snap.Workspaces {
 		t.workspaces[ws.WorkspaceID] = WorkspaceState{WorkspaceID: ws.WorkspaceID, Label: ws.Label, UpdatedAt: now}
@@ -372,6 +398,7 @@ func (t *Tracker) ApplySnapshot(snap snapshot.Snapshot) {
 				seed.AttentionStartedAt = now
 			}
 			t.agents[pane.PaneID] = seed
+			t.incrStateLocked(seed.WorkspaceID, seed.Status)
 		}
 	}
 }
