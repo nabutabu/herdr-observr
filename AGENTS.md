@@ -40,8 +40,17 @@ docs/assumptions instead of a live Herdr instance. The house rule:
   touches the socket protocol (event payloads, `session.snapshot` shape,
   RPC behavior), it must be checked against a live Herdr instance (or, at
   minimum, against the already-verified findings recorded in code comments
-  in `internal/events/event.go`, `internal/snapshot/snapshot.go`, and this
-  file) before being trusted.
+in `internal/events/event.go`, `internal/snapshot/snapshot.go`, and this
+   file) before being trusted.
+- **Consult the real Herdr source, not memory.** When deciding any object
+  shape, event payload, RPC behavior, or structure received from the Herdr
+  socket, always refer to the actual Herdr project at
+  `https://github.com/herdrdev/herdr` (the upstream home of the project; the
+  fork you can clone/fetch from is `nabutabu/herdr`). Do not trust model
+  memory, other plugins, or older docs over that source. Where this file's
+  confirmed findings (or the comments in `internal/events/event.go` /
+  `internal/snapshot/snapshot.go`) conflict with or stray from that source,
+  note the discrepancy rather than silently overriding.
 - When re-fetching this repo itself (e.g. to diff before editing), use the
   tarball approach, not the GitHub tree API or raw-path guessing:
   ```sh
@@ -104,11 +113,23 @@ bearing for the current design. Treat them as constraints, not suggestions:
    Hostname is only ever a secondary, display-only attribute
    (`herdr.machine.hostname`), read via the plugin's own OS call.
 8. **`session.snapshot` has `tabs[]` and `layouts[]`** beyond
-   workspaces/panes/agents. `tabs[]` is in scope (modeled as `snapshot.Tab`)
-   — but no tab-lifecycle events exist on the subscription, so tab removal
-   can *only* happen via reconciliation against a fresh snapshot, never via
-   an event. `layouts[]` is pure UI geometry and is intentionally not
-   modeled anywhere.
+    workspaces/panes/agents. `layouts[]` is pure UI geometry and is
+    intentionally not modeled anywhere. **Correction (verified against the
+    upstream herdr v0.9.0 source, `src/api/schema/events.rs`,
+    `src/app/creation.rs`, `src/app/api/tabs.rs`): tab-lifecycle events DO
+    exist on the subscription** — `tab.created`, `tab.closed`, `tab.renamed`
+    (all kind-scoped, no pane_id) — and the tracker subscribes to them
+    (`internal/events/subscription.go`). The earlier claim that "no
+    tab-lifecycle events exist" was an over-conclusion drawn from a
+    subscription that never requested the tab kinds; trust the source, and
+    re-spike against a live instance before depending on it again. Two
+    follow-on wire facts anchored to that source:
+    - Closing a tab emits **no `pane.closed` for its panes** — they are
+      destroyed silently in `handle_tab_close`. `Tracker.ApplyTabClosed`
+      therefore cascades the tab's panes/agents itself (mirroring
+      `ApplyWorkspaceClosed`).
+    - `tab.closed` on the last tab is immediately followed by
+      `workspace.closed`, whose cascade is idempotent against the tab's.
 
 ## Architecture (current)
 
@@ -116,12 +137,15 @@ bearing for the current design. Treat them as constraints, not suggestions:
 main.go                        # entrypoint: signal handling, delegates to internal/app
 internal/app/app.go            # process lifecycle: ping → bootstrap snapshot → subscribe →
                                 #   event loop → reconnect-on-error → reconciliation-driven resubscribe
+internal/app/scope.go           # App's live subscription state: the subscribed-pane set for
+                                #   pane.agent_status_changed, seeded by SubscribeFromSnapshot
 internal/client/
   client.go                    # Dial, SocketPath (HERDR_SOCKET_PATH), one-shot Call()
   rpc.go                       # Request/Response wire types, WriteFrame/ReadFrame (NDJSON framing)
 internal/events/
   subscription.go              # SubscriptionType consts, BuildParams, SubscribeFromSnapshot
-                                #   (fetches session.snapshot + opens a pane-scoped subscription)
+                                #   (fetches session.snapshot, opens a pane-scoped subscription,
+                                #   returns the subscribed pane IDs it scoped the subscribe to)
   subscriber.go                # Subscriber: dedicated long-lived connection + reader goroutine,
                                 #   Events() <-chan NormalizedEvent, Err() <-chan error
   event.go                     # Kind enum, NormalizedEvent, parseFrame (single-pass classify+normalize)
@@ -198,10 +222,13 @@ update).
 - **Idempotent state application, not sequence-based dedup.** There is no
   sequence number on the wire (finding #3). `Tracker.ApplyEvent` always
   upserts by id; don't add ordering assumptions.
-- **Reconciliation is primary, not a backstop**, specifically for: tab
-  removal (no tab-lifecycle events exist) and silent-stream detection (no
-  socket error on a stalled subscription). Don't demote `Tracker.Run` to an
-  optional safety net in comments or logic — it is load-bearing.
+- **Reconciliation is primary, not a backstop.** It remains the sole
+  detector of a silently stalled subscription (no socket error) and of
+  missing events in any category — tab membership drift was questionable
+  while tab events were assumed absent, but now that `tab.created`/`tab.closed`
+  are subscribed, `Tracker.Diff` reports tab-id membership drift too. Don't
+  demote `Tracker.Run` to an optional safety net in comments or logic — it is
+  load-bearing.
 - **Spike before building** on anything touching the live socket protocol.
   Throwaway `cmd/spike-*/main.go` binaries are the expected pattern; delete
   them after extracting the finding.

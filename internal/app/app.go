@@ -22,6 +22,13 @@ const maxInitialAttempts = 5
 type App struct {
 	sub *events.Subscriber
 	tr  *tracker.Tracker
+
+	// scope is the live coverage of the current subscription: the pane IDs it
+	// scopes pane.agent_status_changed to, as returned by SubscribeFromSnapshot
+	// at the last (re)subscribe. All lifecycle events are kind-scoped and need
+	// no such set; only agent_status_changed is per-pane. Read/written solely
+	// on the Run event-loop goroutine — no locking. Nil until Run subscribes.
+	scope *scope
 }
 
 func New() *App {
@@ -35,11 +42,12 @@ func (a *App) Run(ctx context.Context) error {
 		return fmt.Errorf("ping herdr: %w", err)
 	}
 
-	sub, resp, ok := subscribeWithBackoff(ctx, maxInitialAttempts)
+	paneIDs, sub, resp, ok := subscribeWithBackoff(ctx, maxInitialAttempts)
 	if !ok {
 		return fmt.Errorf("initial session snapshot failed; aborting")
 	}
 	a.sub = sub
+	a.scope = newScope(paneIDs)
 	defer func() { a.sub.Close() }() // reconnect() swaps a.sub; close the last one
 
 	a.tr = tracker.NewTracker()
@@ -60,10 +68,7 @@ func (a *App) Run(ctx context.Context) error {
 		if !report.Drifted() {
 			return
 		}
-		select {
-		case resubscribe <- struct{}{}:
-		default:
-		}
+		signalResubscribe(resubscribe)
 	}
 	go a.tr.Run(ctx, time.Minute, onReport)
 
@@ -78,6 +83,14 @@ func (a *App) Run(ctx context.Context) error {
 			}
 
 			a.handleEvent(ev)
+			if a.paneCreatedNeedsResubscribe(ev) {
+				// The pane was created after the last snapshot-scoped
+				// subscription, so pane.agent_status_changed isn't covering it
+				// (herdr only delivers that event for pre-existing panes). Fold
+				// it in now rather than waiting up to a reconcile interval for a
+				// drift-triggered resubscribe.
+				signalResubscribe(resubscribe)
+			}
 			slog.Info("Parsed Event", "event", ev)
 
 		case err := <-a.sub.Err():
@@ -112,6 +125,12 @@ func (a *App) handleEvent(ev events.NormalizedEvent) {
 		a.tr.ApplyWorkspaceCreated(ev)
 	case events.KindWorkspaceClosed:
 		a.tr.ApplyWorkspaceClosed(ev)
+	case events.KindTabCreated:
+		a.tr.ApplyTabCreated(ev)
+	case events.KindTabClosed:
+		a.tr.ApplyTabClosed(ev)
+	case events.KindTabRenamed:
+		a.tr.ApplyTabRenamed(ev)
 	case events.KindPaneCreated:
 		a.tr.ApplyPaneCreated(ev)
 	case events.KindPaneClosed:
@@ -122,6 +141,27 @@ func (a *App) handleEvent(ev events.NormalizedEvent) {
 		a.tr.ApplyAgentStatusChanged(ev)
 	default:
 		slog.Warn("unhandled event kind; skipping", "kind", ev.Kind)
+	}
+}
+
+// paneCreatedNeedsResubscribe reports whether a pane.created event concerns a
+// pane the current subscription does not cover for status changes. Purely a
+// decision predicate: the caller (Run's event loop) owns signaling, keeping
+// the single-writer rule intact.
+func (a *App) paneCreatedNeedsResubscribe(ev events.NormalizedEvent) bool {
+	if ev.Kind != events.KindPaneCreated {
+		return false
+	}
+	return a.scope == nil || !a.scope.subscribed(ev.PaneID) // nil scope = nothing covered
+}
+
+// signalResubscribe is a non-blocking send matching the channel's "coalesce
+// pending requests" semantics: a full buffer just means a reconnect is already
+// queued.
+func signalResubscribe(ch chan<- struct{}) {
+	select {
+	case ch <- struct{}{}:
+	default:
 	}
 }
 
@@ -142,9 +182,10 @@ func (a *App) ping(ctx context.Context) error {
 // re-report the gap.
 func (a *App) reconnect(ctx context.Context) {
 	a.sub.Close()
-	next, resp, ok := subscribeWithBackoff(ctx, 0)
+	paneIDs, next, resp, ok := subscribeWithBackoff(ctx, 0)
 	if ok {
 		a.sub = next
+		a.scope = newScope(paneIDs)
 		a.tr.ApplySnapshot(resp.Snapshot)
 	}
 }
@@ -153,13 +194,13 @@ func (a *App) reconnect(ctx context.Context) {
 // subscription scoped to the panes it finds, retrying with capped exponential
 // backoff. maxAttempts == 0 means retry forever; otherwise it returns
 // success=false after maxAttempts failed attempts.
-func subscribeWithBackoff(ctx context.Context, maxAttempts int) (*events.Subscriber, snapshot.Response, bool) {
+func subscribeWithBackoff(ctx context.Context, maxAttempts int) ([]string, *events.Subscriber, snapshot.Response, bool) {
 	for attempt := 1; maxAttempts == 0 || attempt <= maxAttempts; attempt++ {
 		cctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-		s, resp, ok := events.SubscribeFromSnapshot(cctx)
+		paneIDs, s, resp, ok := events.SubscribeFromSnapshot(cctx)
 		cancel()
 		if ok {
-			return s, resp, true
+			return paneIDs, s, resp, true
 		}
 		backoff := time.Duration(1<<(attempt-1)) * time.Second
 		if backoff > 30*time.Second {
@@ -169,8 +210,8 @@ func subscribeWithBackoff(ctx context.Context, maxAttempts int) (*events.Subscri
 		select {
 		case <-time.After(backoff):
 		case <-ctx.Done():
-			return nil, snapshot.Response{}, false
+			return nil, nil, snapshot.Response{}, false
 		}
 	}
-	return nil, snapshot.Response{}, false
+	return nil, nil, snapshot.Response{}, false
 }

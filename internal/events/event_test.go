@@ -106,6 +106,73 @@ func TestNormalizePaneEvents(t *testing.T) {
 	}
 }
 
+func TestNormalizeTabEvents(t *testing.T) {
+	tests := []struct {
+		name      string
+		raw       string
+		kind      Kind
+		tab       string
+		workspace string
+		label     string
+	}{
+		{
+			name:      "tab.created with nested tab object",
+			raw:       `{"data":{"tab":{"agent_status":"working","focused":true,"label":"herdr-scribe","number":2,"pane_count":1,"tab_id":"w1:t1","workspace_id":"w1"},"type":"tab_created"},"event":"tab_created"}`,
+			kind:      KindTabCreated,
+			tab:       "w1:t1",
+			workspace: "w1",
+			label:     "herdr-scribe",
+		},
+		{
+			name:      "tab.closed flat",
+			raw:       `{"data":{"tab_id":"w1:t1","type":"tab_closed","workspace_id":"w1"},"event":"tab_closed"}`,
+			kind:      KindTabClosed,
+			tab:       "w1:t1",
+			workspace: "w1",
+		},
+		{
+			name:      "tab.renamed flat with label",
+			raw:       `{"data":{"label":"agents","tab_id":"w1:t1","type":"tab_renamed","workspace_id":"w1"},"event":"tab_renamed"}`,
+			kind:      KindTabRenamed,
+			tab:       "w1:t1",
+			workspace: "w1",
+			label:     "agents",
+		},
+		{
+			name:      "tab.created dotted wire name",
+			raw:       `{"data":{"tab":{"label":"~","pane_count":0,"tab_id":"w1:t2","workspace_id":"w1"},"type":"tab_created"},"event":"tab.created"}`,
+			kind:      KindTabCreated,
+			tab:       "w1:t2",
+			workspace: "w1",
+			label:     "~",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ev, err := Normalize(json.RawMessage(tt.raw))
+			if err != nil {
+				t.Fatalf("Normalize: %v", err)
+			}
+			if ev.Kind != tt.kind {
+				t.Errorf("Kind = %q, want %q", ev.Kind, tt.kind)
+			}
+			if ev.TabID != tt.tab {
+				t.Errorf("TabID = %q, want %q", ev.TabID, tt.tab)
+			}
+			if ev.WorkspaceID != tt.workspace {
+				t.Errorf("WorkspaceID = %q, want %q", ev.WorkspaceID, tt.workspace)
+			}
+			if ev.Label != tt.label {
+				t.Errorf("Label = %q, want %q", ev.Label, tt.label)
+			}
+			if ev.PaneID != "" || ev.Agent != "" || ev.NewState != "" {
+				t.Errorf("unexpected fields populated: %+v", ev)
+			}
+		})
+	}
+}
+
 func TestNormalizeAgentDetected(t *testing.T) {
 	raw := `{"data":{"agent":"codex","pane_id":"w1:p1","type":"pane_agent_detected","workspace_id":"w1"},"event":"pane_agent_detected"}`
 	ev, err := Normalize(json.RawMessage(raw))

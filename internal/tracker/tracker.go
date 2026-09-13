@@ -29,7 +29,7 @@ type PaneState struct {
 type TabState struct {
 	TabID       string
 	WorkspaceID string
-	Label       string // only ever known via snapshot — no event carries it
+	Label       string // from tab.created/tab.renamed events, and snapshot
 	UpdatedAt   time.Time
 }
 
@@ -123,6 +123,19 @@ func NewTracker() *Tracker {
 // logs from it.
 func (t *Tracker) AttentionLatency() <-chan AttentionLatency { return t.attentionLatency }
 
+// Tabs returns the tracked tab state as a shallow copy. Safe to call from any
+// goroutine; phase 3 exporters snapshot it rather than reading under the
+// tracker lock.
+func (t *Tracker) Tabs() map[string]TabState {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	tabs := make(map[string]TabState, len(t.tabs))
+	for k, v := range t.tabs {
+		tabs[k] = v
+	}
+	return tabs
+}
+
 func (t *Tracker) emitAttentionLatency(al AttentionLatency) {
 	select {
 	case t.attentionLatency <- al:
@@ -167,8 +180,79 @@ func (t *Tracker) ApplyWorkspaceClosed(ev events.NormalizedEvent) {
 	}
 }
 
-// ApplyPaneCreated records a pane and seeds tab membership. No tab events
-// exist (0.2), so pane.created is the only event that can seed a tab.
+// ApplyTabCreated records a tab. tab.created is pushed before the root
+// pane.created (herdr src/app/creation.rs), so in the normal flow the tab
+// exists before panes seed it; this being idempotent, ordering between a
+// later duplicate and a pane-seeded tab is also harmless.
+// Idempotent (2.5): duplicate event overwrites the same map key with
+// identical data (aside from UpdatedAt, which is benign).
+func (t *Tracker) ApplyTabCreated(ev events.NormalizedEvent) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	now := t.now()
+	tab := t.tabs[ev.TabID]
+	tab.TabID = ev.TabID
+	tab.WorkspaceID = ev.WorkspaceID
+	tab.Label = ev.Label
+	tab.UpdatedAt = now
+	t.tabs[ev.TabID] = tab
+}
+
+// ApplyTabClosed removes a tab and cascades its panes and agents. Herdr emits
+// no pane.closed for the panes of a closed tab — closing a tab destroys its
+// panes silently (herdr src/app/api/tabs.rs handle_tab_close), so without this
+// cascade the tab's panes/agents would linger (and leak their state counts)
+// until the next re-baseline. Done agents get their attention-latency interval
+// flushed, mirroring ApplyPaneClosed. When the closed tab was the workspace's
+// last, Herdr follows up with workspace.closed, whose cascade is idempotent
+// against this one.
+// Idempotent (2.5): deleting already-missing keys is a no-op.
+func (t *Tracker) ApplyTabClosed(ev events.NormalizedEvent) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	now := t.now()
+	for id, pane := range t.panes {
+		if pane.TabID != ev.TabID {
+			continue
+		}
+		if ag, ok := t.agents[id]; ok {
+			if ag.Status == snapshot.AgentStatusDone {
+				t.emitAttentionLatency(AttentionLatency{
+					PaneID:      ag.PaneID,
+					WorkspaceID: ag.WorkspaceID,
+					Agent:       ag.AgentType,
+					Duration:    now.Sub(ag.AttentionStartedAt),
+					ObservedAt:  now,
+				})
+			}
+			t.decrStateLocked(ag.WorkspaceID, ag.Status)
+		}
+		delete(t.agents, id)
+		delete(t.panes, id)
+	}
+	delete(t.tabs, ev.TabID)
+}
+
+// ApplyTabRenamed updates a tab's label. Pushes carry no pane/agent lifecycle
+// information; only the label changes.
+// Idempotent (2.5): duplicate event sets the same label.
+func (t *Tracker) ApplyTabRenamed(ev events.NormalizedEvent) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	tab := t.tabs[ev.TabID]
+	tab.TabID = ev.TabID
+	if ev.WorkspaceID != "" {
+		tab.WorkspaceID = ev.WorkspaceID
+	}
+	tab.Label = ev.Label
+	tab.UpdatedAt = t.now()
+	t.tabs[ev.TabID] = tab
+}
+
+// ApplyPaneCreated records a pane and seeds tab membership. A pane's tab is
+// normally already known (seeded by ApplySnapshot at baseline or by a prior
+// tab.created); the seed here is an idempotent backstop for panes that arrive
+// without a preceding tab event.
 // Idempotent (2.5): duplicate event overwrites the same map keys harmlessly.
 func (t *Tracker) ApplyPaneCreated(ev events.NormalizedEvent) {
 	t.mu.Lock()
@@ -405,7 +489,7 @@ func (t *Tracker) ApplySnapshot(snap snapshot.Snapshot) {
 
 // Drift is one observed difference between tracked state and a snapshot.
 type Drift struct {
-	Kind    string // "workspace" | "pane"
+	Kind    string // "workspace" | "tab" | "pane"
 	ID      string
 	Tracked string // "" when absent from the tracker
 	Actual  string // "" when absent from the snapshot
@@ -433,9 +517,12 @@ func (r DiffReport) Drifted() bool { return len(r.Drifts) > 0 }
 func (r DiffReport) Empty() bool { return len(r.Drifts) == 0 && len(r.SeenFlips) == 0 }
 
 // Diff compares tracked state against a fresh snapshot without mutating.
-// Workspaces and panes participate; tabs deliberately do not — events can
-// never remove a tab (0.2), so tab membership is not a reliable drift probe
-// and would only manufacture false resubscribes.
+// Workspaces, tabs, and panes participate. Tabs are compared on membership
+// only: a missed tab.updated/rename, label, or focus change is metadata churn
+// that self-heals at the next re-baseline and is deliberately not a drift.
+// Membership drift is load-bearing now that tab.created/tab.closed are
+// subscribed (a missed tab.close event is a genuine event gap, same as a
+// missed pane.close), so a tab present in exactly one side is reported.
 func (t *Tracker) Diff(snap snapshot.Snapshot) DiffReport {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
@@ -451,6 +538,21 @@ func (t *Tracker) Diff(snap snapshot.Snapshot) DiffReport {
 	for _, ws := range snap.Workspaces {
 		if _, ok := t.workspaces[ws.WorkspaceID]; !ok {
 			drifts = append(drifts, Drift{Kind: "workspace", ID: ws.WorkspaceID, Actual: "present"})
+		}
+	}
+
+	snapTabs := make(map[string]struct{}, len(snap.Tabs))
+	for _, tab := range snap.Tabs {
+		snapTabs[tab.TabID] = struct{}{}
+	}
+	for id := range t.tabs {
+		if _, ok := snapTabs[id]; !ok {
+			drifts = append(drifts, Drift{Kind: "tab", ID: id, Tracked: "present"})
+		}
+	}
+	for _, tab := range snap.Tabs {
+		if _, ok := t.tabs[tab.TabID]; !ok {
+			drifts = append(drifts, Drift{Kind: "tab", ID: tab.TabID, Actual: "present"})
 		}
 	}
 

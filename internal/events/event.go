@@ -17,6 +17,9 @@ type Kind string
 const (
 	KindWorkspaceCreated    Kind = "workspace_created"
 	KindWorkspaceClosed     Kind = "workspace_closed"
+	KindTabCreated          Kind = "tab_created"
+	KindTabClosed           Kind = "tab_closed"
+	KindTabRenamed          Kind = "tab_renamed"
 	KindPaneCreated         Kind = "pane_created"
 	KindPaneClosed          Kind = "pane_closed"
 	KindAgentDetected       Kind = "pane_agent_detected"
@@ -48,11 +51,12 @@ type wireFrame struct {
 }
 
 // eventPayload is the body Herdr pushes inside the "data" key. Ids may be
-// flattened directly here or nested in a per-entity object: workspace_created
-// and pane_created carry full entity snapshots (data.workspace / data.pane),
-// while pane_closed, pane.agent_detected, and pane.agent_status_changed
-// flatten pane_id/workspace_id at top level. "type" mirrors the event name on
-// most pushes but is absent on pane.agent_status_changed.
+// flattened directly here or nested in a per-entity object: workspace_created,
+// tab_created, and pane_created carry full entity snapshots (data.workspace /
+// data.tab / data.pane), while pane_closed, pane.agent_detected, and
+// pane.agent_status_changed flatten pane_id/workspace_id at top level. "type"
+// mirrors the event name on most pushes but is absent on
+// pane.agent_status_changed.
 type eventPayload struct {
 	Type        string               `json:"type"`
 	WorkspaceID string               `json:"workspace_id"`
@@ -60,13 +64,24 @@ type eventPayload struct {
 	TabID       string               `json:"tab_id"`
 	Agent       string               `json:"agent"`
 	AgentStatus snapshot.AgentStatus `json:"agent_status"`
+	Label       string               `json:"label"`
 
 	Workspace *workspaceRef `json:"workspace"`
+	Tab       *tabRef       `json:"tab"`
 	Pane      *paneRef      `json:"pane"`
 }
 
 type workspaceRef struct {
 	WorkspaceID string `json:"workspace_id"`
+}
+
+// tabRef is the tab payload on tab.created (a full TabInfo:
+// {tab_id, workspace_id, number, label, focused, pane_count, agent_status}).
+// Only the id/label fields are modeled; the rest is display/geometry metadata.
+type tabRef struct {
+	TabID       string `json:"tab_id"`
+	WorkspaceID string `json:"workspace_id"`
+	Label       string `json:"label"`
 }
 
 type paneRef struct {
@@ -87,8 +102,8 @@ type paneRef struct {
 type NormalizedEvent struct {
 	Kind        Kind
 	WorkspaceID string
-	PaneID      string // zero for workspace-level events
-	TabID       string // only populated for pane.created
+	PaneID      string // zero for workspace/tab-level events
+	TabID       string // populated for pane.created and all tab.* events
 
 	// Agent identifies which agent this event concerns. Populated for
 	// AgentDetected and AgentStatusChanged only.
@@ -97,6 +112,10 @@ type NormalizedEvent struct {
 	// NewState is the state an AgentStatusChanged event is reporting.
 	// Zero value for all other Kinds.
 	NewState snapshot.AgentStatus
+
+	// Label is the tab label reported by tab.created/tab.renamed. Zero for
+	// all other Kinds.
+	Label string
 
 	// Raw preserves the original wire frame for debugging/replay. Not
 	// intended for downstream logic to depend on.
@@ -146,6 +165,11 @@ func parseFrame(raw json.RawMessage) (frameKind, NormalizedEvent, error) {
 	if w.Data.Workspace != nil {
 		ev.WorkspaceID = w.Data.Workspace.WorkspaceID
 	}
+	if w.Data.Tab != nil {
+		ev.TabID = w.Data.Tab.TabID
+		ev.WorkspaceID = w.Data.Tab.WorkspaceID
+		ev.Label = w.Data.Tab.Label
+	}
 	if w.Data.Pane != nil {
 		ev.PaneID = w.Data.Pane.PaneID
 		ev.WorkspaceID = w.Data.Pane.WorkspaceID
@@ -159,6 +183,9 @@ func parseFrame(raw json.RawMessage) (frameKind, NormalizedEvent, error) {
 	}
 	if ev.TabID == "" {
 		ev.TabID = w.Data.TabID
+	}
+	if ev.Label == "" {
+		ev.Label = w.Data.Label
 	}
 	ev.Agent = w.Data.Agent
 	ev.NewState = w.Data.AgentStatus
@@ -176,6 +203,9 @@ func parseFrame(raw json.RawMessage) (frameKind, NormalizedEvent, error) {
 	switch kind {
 	case KindWorkspaceCreated,
 		KindWorkspaceClosed,
+		KindTabCreated,
+		KindTabClosed,
+		KindTabRenamed,
 		KindPaneCreated,
 		KindPaneClosed,
 		KindAgentDetected,

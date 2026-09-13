@@ -687,22 +687,135 @@ func TestDiffDetectsAddedWorkspace(t *testing.T) {
 	}
 }
 
-func TestDiffIgnoresTabMembership(t *testing.T) {
+func TestDiffDetectsTabMembership(t *testing.T) {
+	base := func(tabs []snapshot.Tab) snapshot.Snapshot {
+		return snapshot.Snapshot{
+			Workspaces: []snapshot.Workspace{{WorkspaceID: "w1"}},
+			Tabs:       tabs,
+			Panes:      workingPanes(""),
+		}
+	}
+
+	// Snapshot gained a tab the tracker never saw -> drift.
+	tr := NewTracker()
+	tr.ApplySnapshot(base([]snapshot.Tab{{TabID: "w1:t1", WorkspaceID: "w1"}}))
+	report := tr.Diff(base([]snapshot.Tab{{TabID: "w1:t1", WorkspaceID: "w1"}, {TabID: "w1:t2", WorkspaceID: "w1"}}))
+	if !report.Drifted() {
+		t.Fatal("expected drift for added tab")
+	}
+	if report.Drifts[0].Kind != "tab" || report.Drifts[0].ID != "w1:t2" {
+		t.Errorf("drifts = %+v", report.Drifts)
+	}
+
+	// Tracker still holds a tab the snapshot dropped (e.g. missed tab.closed)
+	// -> drift.
+	tr = NewTracker()
+	tr.ApplySnapshot(base([]snapshot.Tab{{TabID: "w1:t1", WorkspaceID: "w1"}, {TabID: "w1:t2", WorkspaceID: "w1"}}))
+	report = tr.Diff(base([]snapshot.Tab{{TabID: "w1:t1", WorkspaceID: "w1"}}))
+	if !report.Drifted() {
+		t.Fatal("expected drift for removed tab")
+	}
+	if report.Drifts[0].Kind != "tab" || report.Drifts[0].ID != "w1:t2" {
+		t.Errorf("drifts = %+v", report.Drifts)
+	}
+}
+
+func TestDiffIgnoresTabMetadataChanges(t *testing.T) {
 	snap := snapshot.Snapshot{
 		Workspaces: []snapshot.Workspace{{WorkspaceID: "w1"}},
-		Tabs:       []snapshot.Tab{{TabID: "w1:t1", WorkspaceID: "w1"}, {TabID: "w1:t2", WorkspaceID: "w1"}},
+		Tabs:       []snapshot.Tab{{TabID: "w1:t1", WorkspaceID: "w1", Label: "renamed", Number: 9, Focused: true}},
 		Panes:      workingPanes(""),
 	}
 
 	tr := NewTracker()
 	tr.ApplySnapshot(snapshot.Snapshot{
 		Workspaces: []snapshot.Workspace{{WorkspaceID: "w1"}},
-		Tabs:       []snapshot.Tab{{TabID: "w1:t1", WorkspaceID: "w1"}},
+		Tabs:       []snapshot.Tab{{TabID: "w1:t1", WorkspaceID: "w1", Label: "old", Number: 1, Focused: false}},
 		Panes:      workingPanes(""),
 	})
 
 	if report := tr.Diff(snap); report.Drifted() {
-		t.Fatalf("tab-only changes must not drift: %+v", report.Drifts)
+		t.Fatalf("tab metadata changes (label/number/focused) must not drift: %+v", report.Drifts)
+	}
+}
+
+func TestApplyTabLifecycleTracksState(t *testing.T) {
+	tr := NewTracker()
+	tr.ApplyTabCreated(events.NormalizedEvent{TabID: "w1:t1", WorkspaceID: "w1", Label: "herdr-scribe"})
+
+	tr.mu.RLock()
+	tab := tr.tabs["w1:t1"]
+	tr.mu.RUnlock()
+	if tab.Label != "herdr-scribe" || tab.WorkspaceID != "w1" {
+		t.Fatalf("tab after created = %+v", tab)
+	}
+
+	tr.ApplyTabRenamed(events.NormalizedEvent{TabID: "w1:t1", Label: "agents"})
+	tr.mu.RLock()
+	tab = tr.tabs["w1:t1"]
+	tr.mu.RUnlock()
+	if tab.Label != "agents" {
+		t.Errorf("tab label after rename = %q, want agents", tab.Label)
+	}
+
+	tr.ApplyTabClosed(events.NormalizedEvent{TabID: "w1:t1", WorkspaceID: "w1"})
+	tr.mu.RLock()
+	_, gone := tr.tabs["w1:t1"]
+	tr.mu.RUnlock()
+	if gone {
+		t.Error("tab still tracked after close")
+	}
+}
+
+func TestApplyTabClosedCascadesPanesAndAgents(t *testing.T) {
+	cur := time.Date(2026, 9, 11, 12, 0, 0, 0, time.UTC)
+	tr := NewTracker()
+	tr.now = func() time.Time { return cur }
+
+	tr.ApplyTabCreated(events.NormalizedEvent{TabID: "w1:t1", WorkspaceID: "w1"})
+	tr.ApplyTabCreated(events.NormalizedEvent{TabID: "w1:t2", WorkspaceID: "w1"})
+	tr.ApplyPaneCreated(events.NormalizedEvent{PaneID: "w1:p1", WorkspaceID: "w1", TabID: "w1:t1"})
+	tr.ApplyPaneCreated(events.NormalizedEvent{PaneID: "w1:p2", WorkspaceID: "w1", TabID: "w1:t1"})
+	tr.ApplyPaneCreated(events.NormalizedEvent{PaneID: "w1:p3", WorkspaceID: "w1", TabID: "w1:t2"})
+	tr.ApplyAgentStatusChanged(events.NormalizedEvent{PaneID: "w1:p1", WorkspaceID: "w1", Agent: "codex", NewState: snapshot.AgentStatusDone})
+	cur = cur.Add(3 * time.Minute)
+	tr.ApplyAgentStatusChanged(events.NormalizedEvent{PaneID: "w1:p2", WorkspaceID: "w1", Agent: "codex", NewState: snapshot.AgentStatusWorking})
+
+	// Closing t1 emits no pane.closed for its panes (herdr handle_tab_close),
+	// so the cascade must remove them and flush the done interval.
+	tr.ApplyTabClosed(events.NormalizedEvent{TabID: "w1:t1", WorkspaceID: "w1"})
+
+	select {
+	case al := <-tr.AttentionLatency():
+		if al.PaneID != "w1:p1" || al.Duration != 3*time.Minute {
+			t.Errorf("cascaded attention latency = %+v, want done pane w1:p1 after 3m", al)
+		}
+	default:
+		t.Fatal("no attention latency flushed for done pane in closed tab")
+	}
+
+	tr.mu.RLock()
+	defer tr.mu.RUnlock()
+	if _, ok := tr.tabs["w1:t1"]; ok {
+		t.Error("tab w1:t1 still tracked")
+	}
+	if _, ok := tr.tabs["w1:t2"]; !ok {
+		t.Error("tab w1:t2 must survive the cascade")
+	}
+	if _, ok := tr.panes["w1:p1"]; ok {
+		t.Error("pane w1:p1 still tracked after tab close")
+	}
+	if _, ok := tr.agents["w1:p1"]; ok {
+		t.Error("agent w1:p1 still tracked after tab close")
+	}
+	if _, ok := tr.panes["w1:p2"]; ok {
+		t.Error("pane w1:p2 still tracked after tab close")
+	}
+	if _, ok := tr.agents["w1:p2"]; ok {
+		t.Error("agent w1:p2 still tracked after tab close")
+	}
+	if _, ok := tr.panes["w1:p3"]; !ok {
+		t.Error("pane w1:p3 (other tab) must survive")
 	}
 }
 
