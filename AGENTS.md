@@ -27,21 +27,27 @@ The full phased implementation plan (Phase 0–6, resolved architecture
 decisions, spike findings, changelog of what changed and why) lives outside
 this repo in the project's planning document — treat this file as the
 implementation-facing companion to that plan, not a replacement. If you have
-access to that plan, read it before starting Phase 0–2 work; it has far more
+access to that plan, read it before starting Phase 2–3 work; it has far more
 rationale than fits here. If it is not available to you, the summary below
 is the minimum you need.
 
 ## Verify over trust
 
 This codebase has already been burned once by trusting stale
-docs/assumptions instead of a live Herdr instance. The house rule:
+docs/assumptions instead of a live Herdr instance — and, separately, by
+trusting *this file* after the code had moved past it. The house rule:
 
 - **Never** implement against remembered/assumed wire shapes. If a change
   touches the socket protocol (event payloads, `session.snapshot` shape,
   RPC behavior), it must be checked against a live Herdr instance (or, at
   minimum, against the already-verified findings recorded in code comments
-in `internal/events/event.go`, `internal/snapshot/snapshot.go`, and this
-   file) before being trusted.
+  in `internal/events/event.go`, `internal/snapshot/snapshot.go`, and this
+  file) before being trusted.
+- **Never trust this file's "Phase status" section over the tree.** It is
+  hand-maintained prose describing code, which means it can and does lag —
+  it has already done so once (see the note at the top of that section).
+  Before claiming a phase item is done or not done, `grep`/`view` the actual
+  package and its `_test.go` file.
 - **Consult the real Herdr source, not memory.** When deciding any object
   shape, event payload, RPC behavior, or structure received from the Herdr
   socket, always refer to the actual Herdr project at
@@ -83,19 +89,33 @@ bearing for the current design. Treat them as constraints, not suggestions:
    `{agent, agent_status, pane_id, workspace_id}` (+ occasional nesting —
    see `internal/events/event.go`'s `eventPayload`/`workspaceRef`/`paneRef`
    handling). There is no event-level dedup available; idempotent state
-   application is the only dedup mechanism (see `tracker.ApplyEvent`, which
-   upserts rather than assuming ordering).
+   application is the only dedup mechanism (see the tracker's per-kind
+   `Apply*` methods, which upsert rather than assuming ordering).
 4. **The wire frame has no top-level `type` field.** Pushed events arrive as
    `{"event": "pane.agent_status_changed", "data": {...}}`. `event.go`'s
-   `parseFrame` is the single source of truth for classifying and
-   normalizing a frame in one decode pass — do not reintroduce a separate
-   classify-then-normalize split (that was a real double-unmarshal bug that
-   got fixed).
+   `parseFrame`/`wireFrame` is the single source of truth for classifying
+   and normalizing a frame in one decode pass — do not reintroduce a
+   separate classify-then-normalize split (that was a real double-unmarshal
+   bug that got fixed).
 5. **`done` is only reachable through genuine agent detection.**
-   `pane.report_agent --state` accepts `idle|working|blocked|unknown` only.
-   You cannot synthetically drive an agent into `done` — any test or exit
-   criterion touching `done`/attention-latency needs a real coding agent
-   running under Herdr's own detection, not a scripted RPC sequence.
+   `pane.report_agent --state` accepts `idle|working|blocked|unknown` only —
+   verified against `herdr src/cli.rs parse_pane_agent_state` and a live CLI.
+   You cannot push `done` through the RPC. **(Live-verified refinement, 2026-09:
+   you *can* reach `done` without a full coding agent.)** Reporting `idle` on a
+   pane that is unfocused/unseen lets Herdr's own detection engine convert
+   `idle && !seen` → `done` and push a real `pane.agent_status_changed` with
+   `agent_status: done` — so environment 0.4's gate ("needs a real agent") is
+   really a gate on Herdr *detection*, and an unseen pane can be scripted into
+   done via `--state idle`. Leaving `done` headlessly works too: any
+   `report_agent` state change out of `done` fires the event-driven close path
+   (`ApplyAgentStatusChanged`), which the tracker closed to sub-second accuracy
+   live (2m50.806s vs. 170.999s wall). The *seen*-flip close path (leaving done
+   by being seen) could **not** be triggered from the headless CLI: `send-keys`
+   on an unfocused pane in a non-focused workspace does not flip `seen` — seen
+   is flipped by the TUI client's focus/rendering, so live seen-flip
+   verification needs the actual TUI client focused on the pane. (Unit
+   fixtures still construct `done` synthetically for the tracker layer, which
+   is fine.)
 6. **Subscriptions can go silently dead.** After repeated
    subscribe/disconnect cycles, the stream can stop delivering pushed events
    with *no socket error at all* — no EOF, no error, just silence. A
@@ -113,32 +133,50 @@ bearing for the current design. Treat them as constraints, not suggestions:
    Hostname is only ever a secondary, display-only attribute
    (`herdr.machine.hostname`), read via the plugin's own OS call.
 8. **`session.snapshot` has `tabs[]` and `layouts[]`** beyond
-    workspaces/panes/agents. `layouts[]` is pure UI geometry and is
-    intentionally not modeled anywhere. **Correction (verified against the
-    upstream herdr v0.9.0 source, `src/api/schema/events.rs`,
-    `src/app/creation.rs`, `src/app/api/tabs.rs`): tab-lifecycle events DO
-    exist on the subscription** — `tab.created`, `tab.closed`, `tab.renamed`
-    (all kind-scoped, no pane_id) — and the tracker subscribes to them
-    (`internal/events/subscription.go`). The earlier claim that "no
-    tab-lifecycle events exist" was an over-conclusion drawn from a
-    subscription that never requested the tab kinds; trust the source, and
-    re-spike against a live instance before depending on it again. Two
-    follow-on wire facts anchored to that source:
-    - Closing a tab emits **no `pane.closed` for its panes** — they are
+   workspaces/panes/agents. `layouts[]` is pure UI geometry and is
+   intentionally not modeled anywhere. Tab-lifecycle events **do** exist on
+   the subscription — `tab.created`, `tab.closed`, `tab.renamed` (all
+   kind-scoped, no `pane_id`) — verified against upstream
+   `src/api/schema/events.rs`, `src/app/creation.rs`, `src/app/api/tabs.rs`,
+   and now fully wired: `internal/events/subscription.go` subscribes to all
+   three, `internal/events/event.go` normalizes them
+   (`KindTabCreated`/`KindTabClosed`/`KindTabRenamed`), and
+   `internal/tracker/tracker.go` applies them
+   (`ApplyTabCreated`/`ApplyTabClosed`/`ApplyTabRenamed`). Two follow-on wire
+   facts anchored to that source:
+   - Closing a tab emits **no `pane.closed` for its panes** — they are
       destroyed silently in `handle_tab_close`. `Tracker.ApplyTabClosed`
       therefore cascades the tab's panes/agents itself (mirroring
-      `ApplyWorkspaceClosed`).
-    - `tab.closed` on the last tab is immediately followed by
-      `workspace.closed`, whose cascade is idempotent against the tab's.
+      `ApplyWorkspaceClosed`), including flushing any open attention-latency
+      interval. Each cascaded entity enters its close grace window (2.7)
+      instead of vanishing immediately.
+   - `tab.closed` on the last tab is immediately followed by
+      `workspace.closed`, whose cascade is idempotent against the tab's
+      (the `closeAgentLocked`/`closePaneLocked` guards make the double
+      cascade emit attention latency and decrement each agent exactly once).
+9. **`pane.agent_status_changed` is structurally pane-scoped — there is no
+   global form.** Herdr probes `pane_id` at subscribe time and rejects an
+   unscoped subscription outright (`"invalid request: missing field
+   pane_id"`). This means a pane created *after* the last subscribe is
+   invisible to status-change events until the subscription is rebuilt to
+   include it. `internal/app/scope.go` tracks exactly which panes the live
+   subscription covers; `app.paneCreatedNeedsResubscribe` checks each
+   incoming `pane.created` against that set and triggers a resubscribe
+   (via the same `resubscribe` channel the drift-detector in
+   `Tracker.Run` uses) the moment an uncovered pane shows up, rather than
+   waiting up to a full reconcile interval.
 
 ## Architecture (current)
 
 ```
 main.go                        # entrypoint: signal handling, delegates to internal/app
 internal/app/app.go            # process lifecycle: ping → bootstrap snapshot → subscribe →
-                                #   event loop → reconnect-on-error → reconciliation-driven resubscribe
-internal/app/scope.go           # App's live subscription state: the subscribed-pane set for
+                                #   event loop → reconnect-on-error → reconciliation-driven
+                                #   resubscribe → pane.created-triggered resubscribe
+internal/app/scope.go          # App's live subscription state: the subscribed-pane set for
                                 #   pane.agent_status_changed, seeded by SubscribeFromSnapshot
+                                #   and replaced wholesale on every (re)subscribe
+internal/app/app_test.go       # scope + resubscribe-trigger + event-routing tests
 internal/client/
   client.go                    # Dial, SocketPath (HERDR_SOCKET_PATH), one-shot Call()
   rpc.go                       # Request/Response wire types, WriteFrame/ReadFrame (NDJSON framing)
@@ -148,13 +186,22 @@ internal/events/
                                 #   returns the subscribed pane IDs it scoped the subscribe to)
   subscriber.go                # Subscriber: dedicated long-lived connection + reader goroutine,
                                 #   Events() <-chan NormalizedEvent, Err() <-chan error
-  event.go                     # Kind enum, NormalizedEvent, parseFrame (single-pass classify+normalize)
+  event.go                     # Kind enum, NormalizedEvent, wireFrame, parseFrame
+                                #   (single-pass classify+normalize)
 internal/snapshot/
   snapshot.go                  # Response/Snapshot/Workspace/Pane/Tab/Agent structs, Fetch()
 internal/tracker/
-  tracker.go                   # Tracker: mutex-guarded workspaces/tabs/panes maps.
-                                #   ApplyEvent (steady-state writer), ApplySnapshot (bootstrap/re-baseline),
-                                #   Diff/DiffReport (read-only comparison), Run (periodic reconcile loop)
+  tracker.go                   # Tracker: mutex-guarded workspaces/tabs/panes/agents maps.
+                                #   Per-kind ApplyWorkspaceCreated/.../ApplyAgentStatusChanged/
+                                #   ApplySeenFlip (steady-state writers), ApplySnapshot
+                                #   (bootstrap/re-baseline), Diff/DiffReport (read-only
+                                #   comparison, including tab membership and the done→idle
+                                #   seen-flip distinction), Run (periodic reconcile loop),
+                                #   close helpers + EvictExpired (2.7 grace-window cleanup)
+  counts.go                    # AgentCounts, Tracker.Counts(): live per-state agent counts,
+                                #   global and per-workspace, maintained incrementally
+                                #   (incrStateLocked/decrStateLocked) — feeds Phase 3's
+                                #   herdr.agent.* and herdr.workspace.agent.concurrent gauges
 ```
 
 Ownership rules embedded in this structure — preserve them when extending:
@@ -162,73 +209,143 @@ Ownership rules embedded in this structure — preserve them when extending:
 - **`Subscriber`** exposes no write surface after construction. If you need
   to call an RPC, open a new connection via `client.Call`; never reuse the
   subscription connection.
-- **`Tracker`** has exactly one writer path in steady state (`ApplyEvent`,
-  called from `app.Run`'s event-loop `case`) and one re-baseline path
-  (`ApplySnapshot`, called on initial bootstrap and after every reconnect).
-  `Tracker.Run`'s reconciliation loop is **read-only** — it diffs and calls
-  `onDrift()`, it never mutates tracker state directly. This separation is
+- **`Tracker`** has exactly one writer path in steady state (the per-kind
+  `Apply*` methods, called from `app.handleEvent`, itself called
+  synchronously from `app.Run`'s event-loop `case`) and one re-baseline path
+  (`ApplySnapshot`, called on initial bootstrap and after every reconnect),
+  plus one housekeeping writer (`EvictExpired`, 2.7) fired from `app.Run`'s
+  own ticker — still on the single event-loop goroutine.
+  `Tracker.Run`'s reconciliation loop is **read-only** — it diffs
+  (`Diff`/`DiffReport`) and calls `onReport()` with drifts and seen-flips;
+  it never mutates tracker state directly. Applying a seen-flip
+  (`ApplySeenFlip`) is `app.Run`'s job, invoked from the same `onReport`
+  callback that decides whether to resubscribe. This separation is
   intentional: it keeps a single owner (`app.Run`) responsible for actually
-  tearing down and recreating the subscription, so there's no risk of two
-  goroutines racing to swap `a.sub`.
+  tearing down and recreating the subscription and for all tracker writes,
+  so there's no risk of two goroutines racing.
 - **`app.App.reconnect`** is the only path that closes and replaces the
-  subscription, whether triggered by a hard error (`sub.Err()`) or a drift
-  signal from the reconciliation loop (`resubscribe` channel). Both trigger
-  the same re-bootstrap: fresh `session.snapshot` → `ApplySnapshot` →
-  `SubscribeFromSnapshot`, so state never trusts a partial gap silently.
+  subscription, whatever triggers it: a hard error (`sub.Err()`), a drift
+  signal from the reconciliation loop, or an uncovered pane surfacing via
+  `paneCreatedNeedsResubscribe`. All three funnel through the same
+  `resubscribe` channel and the same re-bootstrap: fresh `session.snapshot`
+  → `ApplySnapshot` → `SubscribeFromSnapshot` → replace `a.scope`. State
+  never trusts a partial gap silently, and coverage never silently goes
+  stale.
+- **`scope`** is read/written solely on the `app.Run` event-loop goroutine —
+  no locking. It exists because the tracker isn't the right owner of "which
+  panes does the *subscription* cover" (the tracker also knows about panes
+  created after the last subscribe, which is exactly the gap `scope`
+  detects).
 
-## Phase status (do not trust README.md's "Implemented so far" list blindly — cross-check the tree)
+## Phase status (do not trust this section blindly — cross-check the tree)
 
-As of the current `main` branch, the following are implemented and tested:
+**This section itself has already gone stale once** — an earlier revision
+claimed Phase 2 and the pane-coverage resubscribe fix were unimplemented
+after they had, in fact, landed. Treat every line below as a claim to spot-
+check against the actual package and its `_test.go` file, not as ground
+truth.
+
+Implemented and tested, as of the current `main` branch:
 
 - **1.1** — one-shot NDJSON client (`internal/client`)
 - **1.3** — `session.snapshot` fetch/parse (`internal/snapshot.Fetch`)
 - **1.4/1.5** — scoped subscription on its own dedicated connection
-  (`internal/events.Subscriber`, `BuildParams`)
+  (`internal/events.Subscriber`, `BuildParams`), now including
+  `tab.created`/`tab.closed`/`tab.renamed` alongside the original
+  workspace/pane kinds (finding #8)
 - **1.6** — single-pass classify+normalize (`internal/events.parseFrame`,
-  `NormalizedEvent`)
+  `NormalizedEvent`), covering all nine `Kind` values including the three
+  tab kinds
 - **1.7** — reconnect/resubscribe with capped exponential backoff on socket
   error/EOF (`app.subscribeWithBackoff`, `app.reconnect`)
 - **1.8** — periodic reconciliation against a fresh snapshot, independent of
-  socket state, driving a forced resubscribe on drift
+  socket state, driving a forced resubscribe on drift, plus classification
+  of the benign `done`→idle seen-flip as distinct from a genuine drift
   (`internal/tracker.Tracker.Run`/`reconcile`/`Diff`)
+- **Pane-coverage resubscribe (the structural gap in finding #9)** —
+  `internal/app/scope.go` plus `app.paneCreatedNeedsResubscribe`. A pane
+  created after the last subscribe triggers an immediate resubscribe
+  instead of waiting for the next reconcile tick.
+- **2.1–2.3** — state machine, per-agent state struct, and
+  duration-by-state accounting (`tracker.AgentState`,
+  `ApplyAgentStatusChanged`)
+- **2.4** — attention-latency tracking, both close paths: a real
+  status-change event out of `done` (`ApplyAgentStatusChanged`) and the
+  silent reconcile-detected seen-flip (`ApplySeenFlip`)
+- **2.5** — idempotent state application (same-state event is a no-op;
+  every `Apply*` upserts by id rather than assuming ordering)
+- **2.6** — workspace/global agent concurrency counts, maintained
+  incrementally on every transition (`internal/tracker/counts.go`,
+  `Tracker.Counts()`), including cleanup on workspace/tab/pane close so the
+  counters can't leak
+- **2.7** — bounded in-memory retention / grace window. Closing a pane/tab/
+  workspace now flushes final durations and attention latency, decrements
+  counts *immediately*, but retains the entities with `ClosedAt` stamped for
+  a 15s grace window (`tracker.DefaultGraceWindow`) instead of deleting in
+  place — a late status event for a closing pane is absorbed rather than
+  creating a phantom that leaks a state count. `app.Run`'s event loop owns
+  eviction on its own 5s ticker (`app.evictInterval` → `Tracker.EvictExpired`),
+  so retention stays bounded to ~[15,20)s and the single-writer rule holds.
+  Closed entities are skipped by `Diff` (no false drift → no spurious
+  resubscribe) and wiped by any `ApplySnapshot` re-baseline. The workspace
+  cascade now flushes `done` agents' attention-latency intervals too,
+  matching the pane/tab paths, and the `closeAgentLocked` idempotency guard
+  keeps tab.closed-then-workspace.closed double cascades to a single flush
+  and decrement. `DurationByState` is freed at close — Phase 3.4 reads live
+  records, so only identity + `ClosedAt` metadata is retained. `Tracker.Agents()`
+  (added for live verification, mirroring `Tabs()`) snapshots per-agent state
+  for Phase 3.4 exporters.
+- **Phase 2 exit criteria — both parts live-verified 2026-09 against a
+  running Herdr v0.9.0.** (1) `pane.report_agent` drove a pane through
+  working→blocked→working; the tracker closed working=1m24.271s and
+  blocked=39.998s against wall-clock segments of 84.3s/40.0s (sub-10ms
+  accuracy; the final `idle` report became `done` via detection — finding #5).
+  (2) An agent left `done` headlessly and the tracker emitted attention
+  latency 2m50.806s against a 170.999s wall interval, with counts moving
+  (`done`→`working`) and `DurationByState` accumulating the closed done
+  interval. See finding #5 for the headless seen-flip limitation.
 
-**Not yet implemented:**
+**Not yet implemented** — confirmed by `grep`, not just absence from this
+list:
 
 - **1.2** — self-supervising *external process* wrapper with crash/respawn
   backoff for the `[[startup]]` hook itself. The current backoff in
-  `app.subscribeWithBackoff` only covers subscribe/snapshot retries *within*
-  a running process — it does not protect against the process itself
-  crashing (finding #1 above). This is the recommended next piece of work.
-- Herdr plugin packaging (`herdr-plugin.toml`, Phase 4) — no manifest exists
-  in the repo yet.
-- Phase 2 (state-duration/attention-latency tracker on top of
-  `internal/tracker`), Phase 3 (OTel export), Phases 5–6.
-
-Before claiming a phase item is "done," check the actual tree and tests —
-the plan document and README can lag the code (as they currently do for
-1.3/1.6/1.7/1.8, all of which were implemented after the last README
-update).
+  `app.subscribeWithBackoff` only covers subscribe/snapshot retries
+  *within* a running process — it does not protect against the process
+  itself crashing (finding #1). This is the top open item.
+- **Phase 3 (OTel/OTLP export)** — no `otel`/`otlp` import anywhere in the
+  tree yet. `AttentionLatency()` results are currently only logged in
+  `app.Run` (see the `// Phase 3.5 replaces this log` comment there);
+  `Tracker.Counts()` is implemented but nothing reads it yet.
+- **Phase 4 (plugin packaging)** — no `herdr-plugin.toml` in the repo.
+- **Phases 5–6** — reliability hardening and the local demo stack.
 
 ## Conventions
 
 - **Constructed types over package-level globals.** State lives in
-  explicitly constructed structs (`Tracker`, `Subscriber`, `App`) passed
-  around or closed over — not package globals. This is deliberate: it keeps
-  everything independently testable and avoids data races between the
-  event-consumer goroutine and the reconciliation goroutine.
+  explicitly constructed structs (`Tracker`, `Subscriber`, `App`, `scope`)
+  passed around or closed over — not package globals. This is deliberate:
+  it keeps everything independently testable and avoids data races between
+  the event-consumer goroutine and the reconciliation goroutine.
 - **No double-decode.** If you touch wire parsing, keep classify and
-  normalize as a single `json.Unmarshal` pass (`parseFrame`). Splitting them
-  back into two passes was already tried and reverted.
+  normalize as a single `json.Unmarshal` pass (`parseFrame`/`wireFrame`).
+  Splitting them back into two passes was already tried and reverted.
 - **Idempotent state application, not sequence-based dedup.** There is no
-  sequence number on the wire (finding #3). `Tracker.ApplyEvent` always
-  upserts by id; don't add ordering assumptions.
+  sequence number on the wire (finding #3). The tracker's `Apply*` methods
+  always upsert by id; don't add ordering assumptions.
 - **Reconciliation is primary, not a backstop.** It remains the sole
   detector of a silently stalled subscription (no socket error) and of
-  missing events in any category — tab membership drift was questionable
-  while tab events were assumed absent, but now that `tab.created`/`tab.closed`
-  are subscribed, `Tracker.Diff` reports tab-id membership drift too. Don't
-  demote `Tracker.Run` to an optional safety net in comments or logic — it is
-  load-bearing.
+  missing events in any category, including tab membership now that
+  `tab.created`/`tab.closed` are subscribed (`Tracker.Diff` reports tab-id
+  membership drift too). Don't demote `Tracker.Run` to an optional safety
+  net in comments or logic — it is load-bearing. The one thing reconcile
+  does *not* own is pane-coverage gaps for `pane.agent_status_changed` —
+  that has its own faster path (`scope`/`paneCreatedNeedsResubscribe`,
+  finding #9) precisely because waiting a full interval for a brand-new
+  pane was judged too slow.
+- **Single-writer discipline for the tracker.** Every mutating call goes
+  through `app.Run`'s event loop or its `onReport` callback — never call a
+  tracker `Apply*`/`ApplySeenFlip` method from another goroutine.
 - **Spike before building** on anything touching the live socket protocol.
   Throwaway `cmd/spike-*/main.go` binaries are the expected pattern; delete
   them after extracting the finding.
@@ -246,9 +363,18 @@ go test ./...
 Tests run against stub Unix-socket servers (see `startStubServer` helpers in
 `internal/client/client_test.go` and `internal/events/subscriber_test.go`)
 and do not require a live Herdr instance. When adding wire-protocol tests,
-follow that pattern — a real `net.Listen("unix", ...)` in a temp dir — rather
-than mocking at a higher abstraction level, since framing bugs (NDJSON
-boundaries, ack-vs-event classification) only show up at that layer.
+follow that pattern — a real `net.Listen("unix", ...)` in a temp dir —
+rather than mocking at a higher abstraction level, since framing bugs
+(NDJSON boundaries, ack-vs-event classification) only show up at that
+layer.
+
+Tracker-level tests bypass the wire entirely: they construct `NormalizedEvent`
+values directly and feed them to the relevant `Apply*` method
+(`internal/tracker/tracker_test.go`, `counts_test.go`). This is the right
+layer for state-machine/duration/attention-latency/concurrency-count
+assertions — it doesn't need a live agent to exercise `done`, only a
+hand-built event (finding #5 only constrains *live* verification, not unit
+tests).
 
 Live-instance verification (anything under "Verify over trust" above)
 happens separately, via spike binaries against `HERDR_SOCKET_PATH` pointed
