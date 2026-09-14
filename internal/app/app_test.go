@@ -78,7 +78,10 @@ func TestHandleEventRoutesTabKinds(t *testing.T) {
 	a.handleEvent(events.NormalizedEvent{Kind: events.KindTabRenamed, TabID: "w1:t1", Label: "agents"})
 	a.handleEvent(events.NormalizedEvent{Kind: events.KindTabClosed, TabID: "w1:t1", WorkspaceID: "w1"})
 
-	if len(a.tr.Tabs()) != 0 {
-		t.Errorf("tabs after full lifecycle = %v, want empty", a.tr.Tabs())
+	// After the close the tab is retained in its grace window (2.7) until the
+	// app's evict ticker drops it; eviction itself is covered by the tracker
+	// tests with a controllable clock, since ClosedAt is tracker-internal.
+	if got := len(a.tr.Tabs()); got != 1 {
+		t.Errorf("tab after full lifecycle = %d entries, want 1 (retained during grace)", got)
 	}
 }

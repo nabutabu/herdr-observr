@@ -2,6 +2,7 @@ package tracker
 
 import (
 	"testing"
+	"time"
 
 	"github.com/nabutabu/herdr-scribe/internal/events"
 	"github.com/nabutabu/herdr-scribe/internal/snapshot"
@@ -153,7 +154,9 @@ func TestCountsPaneClosedAdjusts(t *testing.T) {
 // bundled fix): closing a workspace removes its agents and their counts, while
 // leaving other workspaces untouched.
 func TestCountsWorkspaceClosedCleansAgentsAndCounts(t *testing.T) {
+	cur := time.Date(2026, 9, 11, 12, 0, 0, 0, time.UTC)
 	tr := NewTracker()
+	tr.now = func() time.Time { return cur }
 	tr.ApplyAgentStatusChanged(statusChange("w1:p1", "w1", "codex", snapshot.AgentStatusWorking))
 	tr.ApplyAgentStatusChanged(statusChange("w1:p2", "w1", "codex", snapshot.AgentStatusBlocked))
 	tr.ApplyAgentStatusChanged(statusChange("w2:p1", "w2", "codex", snapshot.AgentStatusWorking))
@@ -174,12 +177,28 @@ func TestCountsWorkspaceClosedCleansAgentsAndCounts(t *testing.T) {
 		t.Errorf("w2 working = %d, want 1", got)
 	}
 
+	// Counts are dropped at close even though the agent records are retained
+	// in their grace window (2.7), so they can't leak into the gauges.
 	tr.mu.RLock()
-	_, w1p1Gone := tr.agents["w1:p1"]
-	_, w1p2Gone := tr.agents["w1:p2"]
+	ag1, w1p1Present := tr.agents["w1:p1"]
+	ag2, w1p2Present := tr.agents["w1:p2"]
 	tr.mu.RUnlock()
-	if w1p1Gone || w1p2Gone {
-		t.Error("agents of a closed workspace still tracked")
+	if !w1p1Present || ag1.ClosedAt.IsZero() {
+		t.Error("w1:p1 not retained with ClosedAt during grace window")
+	}
+	if !w1p2Present || ag2.ClosedAt.IsZero() {
+		t.Error("w1:p2 not retained with ClosedAt during grace window")
+	}
+
+	cur = cur.Add(16 * time.Second)
+	tr.EvictExpired()
+	tr.mu.RLock()
+	defer tr.mu.RUnlock()
+	if _, still := tr.agents["w1:p1"]; still {
+		t.Error("w1:p1 still tracked after eviction")
+	}
+	if _, still := tr.agents["w1:p2"]; still {
+		t.Error("w1:p2 still tracked after eviction")
 	}
 }
 

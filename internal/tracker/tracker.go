@@ -24,6 +24,12 @@ type PaneState struct {
 	Agent       string
 	Status      snapshot.AgentStatus
 	UpdatedAt   time.Time
+
+	// ClosedAt is set when the pane's close is applied (2.7). Non-zero means
+	// the pane is in the bounded-retention grace window: live tracking over,
+	// but the record is retained briefly so late events are absorbed instead
+	// of creating a phantom. Zero means the pane is live.
+	ClosedAt time.Time
 }
 
 type TabState struct {
@@ -31,6 +37,10 @@ type TabState struct {
 	WorkspaceID string
 	Label       string // from tab.created/tab.renamed events, and snapshot
 	UpdatedAt   time.Time
+
+	// ClosedAt set means the tab is in the retention grace window (2.7),
+	// same semantics as PaneState.ClosedAt.
+	ClosedAt time.Time
 }
 
 type AgentState struct {
@@ -46,6 +56,11 @@ type AgentState struct {
 	// a state before the most recent transition out of it. The open
 	// interval for the current Status is deliberately not kept here;
 	// callers wanting an as-of-now total add time.Since(StateEnteredAt).
+	//
+	// On close (2.7) the open interval is flushed into this map and the map
+	// is then freed (set to nil): at close time the durations have no
+	// consumer yet (Phase 3.4 reads live records), so only identity + ClosedAt
+	// metadata is retained through the grace window.
 	DurationByState map[snapshot.AgentStatus]time.Duration
 
 	// AttentionStartedAt is set when Status transitions into
@@ -53,6 +68,12 @@ type AgentState struct {
 	// DurationByState because attention latency is its own MVP metric
 	// (2.4, 3.5), not folded into generic "time in done".
 	AttentionStartedAt time.Time
+
+	// ClosedAt set means the agent's pane/tab/workspace closed and the agent
+	// is in the retention grace window (2.7). State counts are already
+	// decremented; the record survives only so late status events don't
+	// re-create a phantom. Zero means the agent is live.
+	ClosedAt time.Time
 }
 
 // AttentionLatency is emitted when an agent leaves `done` — the elapsed time
@@ -99,11 +120,22 @@ type Tracker struct {
 	// idiom.
 	attentionLatency chan AttentionLatency
 
+	// graceWindow is how long a closed pane/tab/agent is retained after its
+	// close is applied, so late-arriving events are absorbed instead of
+	// re-creating a phantom (2.7). Defaults to DefaultGraceWindow; EvictExpired
+	// drops records older than this.
+	graceWindow time.Duration
+
 	// now is the clock used by the Apply* methods for duration math. Defaults
 	// to time.Now; tests substitute a fake to make duration assertions
 	// deterministic.
 	now func() time.Time
 }
+
+// DefaultGraceWindow is the retention window for closed entities (2.7):
+// long enough to absorb late events after a close, short enough that
+// closed panes never linger meaningfully in memory (no disk persistence).
+const DefaultGraceWindow = 15 * time.Second
 
 func NewTracker() *Tracker {
 	return &Tracker{
@@ -113,6 +145,7 @@ func NewTracker() *Tracker {
 		agents:               map[string]AgentState{},
 		attentionLatency:     make(chan AttentionLatency, 64),
 		now:                  time.Now,
+		graceWindow:          DefaultGraceWindow,
 		stateCounts:          map[snapshot.AgentStatus]int{},
 		workspaceStateCounts: map[string]map[snapshot.AgentStatus]int{},
 	}
@@ -144,6 +177,90 @@ func (t *Tracker) emitAttentionLatency(al AttentionLatency) {
 	}
 }
 
+// GraceWindow returns the configured retention window for closed entities
+// (2.7).
+func (t *Tracker) GraceWindow() time.Duration {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	return t.graceWindow
+}
+
+// EvictExpired drops closed entities whose grace window has elapsed (2.7).
+// Live entities (ClosedAt zero) are never touched. Called from app.Run's
+// event loop on its own ticker, so all tracker mutation stays on the
+// single-writer goroutine.
+func (t *Tracker) EvictExpired() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	now := t.now()
+	for id, tab := range t.tabs {
+		if !tab.ClosedAt.IsZero() && now.Sub(tab.ClosedAt) > t.graceWindow {
+			delete(t.tabs, id)
+		}
+	}
+	for id, pane := range t.panes {
+		if !pane.ClosedAt.IsZero() && now.Sub(pane.ClosedAt) > t.graceWindow {
+			delete(t.panes, id)
+		}
+	}
+	for id, ag := range t.agents {
+		if !ag.ClosedAt.IsZero() && now.Sub(ag.ClosedAt) > t.graceWindow {
+			delete(t.agents, id)
+		}
+	}
+}
+
+// closeAgentLocked marks a tracked agent closed (2.7): final state interval
+// flushed, attention-latency emitted if it was still `done`, the freed
+// DurationByState map nilled, the state count decremented immediately, and
+// ClosedAt stamped so the record survives its grace window. Idempotent:
+// an already-closed agent is a no-op — this is what keeps the workspace/tab
+// close cascades safe to overlap (a tab.closed followed by workspace.closed
+// must flush attention latency and decrement each agent exactly once).
+func (t *Tracker) closeAgentLocked(id string, now time.Time) {
+	ag, ok := t.agents[id]
+	if !ok || !ag.ClosedAt.IsZero() {
+		return
+	}
+	if ag.Status == snapshot.AgentStatusDone {
+		t.emitAttentionLatency(AttentionLatency{
+			PaneID:      ag.PaneID,
+			WorkspaceID: ag.WorkspaceID,
+			Agent:       ag.AgentType,
+			Duration:    now.Sub(ag.AttentionStartedAt),
+			ObservedAt:  now,
+		})
+	}
+	ag.DurationByState[ag.Status] += now.Sub(ag.StateEnteredAt)
+	ag.DurationByState = nil
+	ag.ClosedAt = now
+	t.agents[id] = ag
+	t.decrStateLocked(ag.WorkspaceID, ag.Status)
+}
+
+// closePaneLocked marks a tracked pane closed (2.7). Idempotent: an
+// already-closed pane is a no-op.
+func (t *Tracker) closePaneLocked(id string, now time.Time) {
+	pane, ok := t.panes[id]
+	if !ok || !pane.ClosedAt.IsZero() {
+		return
+	}
+	pane.ClosedAt = now
+	t.panes[id] = pane
+}
+
+// closeTabLocked marks a tracked tab closed (2.7). Idempotent: an
+// already-closed tab is a no-op. A tab.closed arriving after a
+// workspace.closed already cascaded it is therefore absorbed.
+func (t *Tracker) closeTabLocked(id string, now time.Time) {
+	tab, ok := t.tabs[id]
+	if !ok || !tab.ClosedAt.IsZero() {
+		return
+	}
+	tab.ClosedAt = now
+	t.tabs[id] = tab
+}
+
 // ApplyWorkspaceCreated folds a workspace.created event into the tracked state.
 // Idempotent (2.5): a duplicate event overwrites the same map key with
 // identical data (aside from UpdatedAt, which is benign).
@@ -153,29 +270,32 @@ func (t *Tracker) ApplyWorkspaceCreated(ev events.NormalizedEvent) {
 	t.workspaces[ev.WorkspaceID] = WorkspaceState{WorkspaceID: ev.WorkspaceID, UpdatedAt: t.now()}
 }
 
-// ApplyWorkspaceClosed removes a workspace and cascades its tabs, panes, and
-// agents — their own close events may not arrive. Agents must not be skipped:
-// an agent keyed to a deleted pane would otherwise linger (and leak its state
-// count) until the next re-baseline.
-// Idempotent (2.5): deleting already-missing keys is a no-op.
+// ApplyWorkspaceClosed closes a workspace and cascades its tabs, panes, and
+// agents — their own close events may not arrive. Each entity entered the
+// retention grace window via the close helpers instead of being dropped
+// immediately (2.7): a late `done` agent's attention-latency interval is
+// flushed exactly once (a tab.closed that already cascaded this workspace
+// left its entities ClosedAt, so the cascade is idempotent). The workspace
+// record itself is deleted outright — nothing late can arrive for a
+// workspace id standing alone.
 func (t *Tracker) ApplyWorkspaceClosed(ev events.NormalizedEvent) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	now := t.now()
 	delete(t.workspaces, ev.WorkspaceID)
-	for id, tab := range t.tabs {
-		if tab.WorkspaceID == ev.WorkspaceID {
-			delete(t.tabs, id)
+	for id := range t.tabs {
+		if t.tabs[id].WorkspaceID == ev.WorkspaceID {
+			t.closeTabLocked(id, now)
 		}
 	}
-	for id, pane := range t.panes {
-		if pane.WorkspaceID == ev.WorkspaceID {
-			delete(t.panes, id)
+	for id := range t.panes {
+		if t.panes[id].WorkspaceID == ev.WorkspaceID {
+			t.closePaneLocked(id, now)
 		}
 	}
-	for id, ag := range t.agents {
-		if ag.WorkspaceID == ev.WorkspaceID {
-			t.decrStateLocked(ag.WorkspaceID, ag.Status)
-			delete(t.agents, id)
+	for id := range t.agents {
+		if t.agents[id].WorkspaceID == ev.WorkspaceID {
+			t.closeAgentLocked(id, now)
 		}
 	}
 }
@@ -198,15 +318,16 @@ func (t *Tracker) ApplyTabCreated(ev events.NormalizedEvent) {
 	t.tabs[ev.TabID] = tab
 }
 
-// ApplyTabClosed removes a tab and cascades its panes and agents. Herdr emits
+// ApplyTabClosed closes a tab and cascades its panes and agents. Herdr emits
 // no pane.closed for the panes of a closed tab — closing a tab destroys its
 // panes silently (herdr src/app/api/tabs.rs handle_tab_close), so without this
-// cascade the tab's panes/agents would linger (and leak their state counts)
-// until the next re-baseline. Done agents get their attention-latency interval
-// flushed, mirroring ApplyPaneClosed. When the closed tab was the workspace's
-// last, Herdr follows up with workspace.closed, whose cascade is idempotent
-// against this one.
-// Idempotent (2.5): deleting already-missing keys is a no-op.
+// cascade the tab's panes/agents would linger (and leak their state counts).
+// Closed entities enter the retention grace window (2.7). Done agents get
+// their attention-latency interval flushed, mirroring ApplyPaneClosed. When
+// the closed tab was the workspace's last, Herdr follows up with
+// workspace.closed, whose cascade is idempotent against this one: the close
+// helpers no-op on already-closed entities, so exactly one attention-latency
+// flush and one count decrement happen per agent.
 func (t *Tracker) ApplyTabClosed(ev events.NormalizedEvent) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -215,22 +336,10 @@ func (t *Tracker) ApplyTabClosed(ev events.NormalizedEvent) {
 		if pane.TabID != ev.TabID {
 			continue
 		}
-		if ag, ok := t.agents[id]; ok {
-			if ag.Status == snapshot.AgentStatusDone {
-				t.emitAttentionLatency(AttentionLatency{
-					PaneID:      ag.PaneID,
-					WorkspaceID: ag.WorkspaceID,
-					Agent:       ag.AgentType,
-					Duration:    now.Sub(ag.AttentionStartedAt),
-					ObservedAt:  now,
-				})
-			}
-			t.decrStateLocked(ag.WorkspaceID, ag.Status)
-		}
-		delete(t.agents, id)
-		delete(t.panes, id)
+		t.closeAgentLocked(id, now)
+		t.closePaneLocked(id, now)
 	}
-	delete(t.tabs, ev.TabID)
+	t.closeTabLocked(ev.TabID, now)
 }
 
 // ApplyTabRenamed updates a tab's label. Pushes carry no pane/agent lifecycle
@@ -258,6 +367,12 @@ func (t *Tracker) ApplyPaneCreated(ev events.NormalizedEvent) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	now := t.now()
+	if pane, ok := t.panes[ev.PaneID]; ok && !pane.ClosedAt.IsZero() {
+		// A created event for a pane still in its grace window is an
+		// out-of-order duplicate (2.7): don't silently resurrect it.
+		slog.Debug("ignoring pane.created for closing pane", "pane_id", ev.PaneID)
+		return
+	}
 	t.panes[ev.PaneID] = PaneState{PaneID: ev.PaneID, WorkspaceID: ev.WorkspaceID, TabID: ev.TabID, UpdatedAt: now}
 	if ev.TabID != "" {
 		tab := t.tabs[ev.TabID]
@@ -268,29 +383,19 @@ func (t *Tracker) ApplyPaneCreated(ev events.NormalizedEvent) {
 	}
 }
 
-// ApplyPaneClosed removes a pane. If its agent was still `done`, the
+// ApplyPaneClosed closes a pane. If its agent was still `done`, the
 // attention-latency interval is flushed rather than silently dropped — the
-// pane may close while unseen (2.7's flush-on-close).
-// Idempotent (2.5): deleting an already-missing key is a no-op.
+// pane may close while unseen (2.7's flush-on-close). The pane and agent then
+// enter the retention grace window (2.7): counts are decremented immediately
+// but the records survive until EvictExpired, so a late status event for the
+// pane is absorbed instead of re-creating a phantom. Idempotent — closing an
+// already-closed pane is a no-op.
 func (t *Tracker) ApplyPaneClosed(ev events.NormalizedEvent) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	now := t.now()
-	ag, ok := t.agents[ev.PaneID]
-	if ok {
-		if ag.Status == snapshot.AgentStatusDone {
-			t.emitAttentionLatency(AttentionLatency{
-				PaneID:      ag.PaneID,
-				WorkspaceID: ag.WorkspaceID,
-				Agent:       ag.AgentType,
-				Duration:    now.Sub(ag.AttentionStartedAt),
-				ObservedAt:  now,
-			})
-		}
-		t.decrStateLocked(ag.WorkspaceID, ag.Status)
-	}
-	delete(t.agents, ev.PaneID)
-	delete(t.panes, ev.PaneID)
+	t.closeAgentLocked(ev.PaneID, now)
+	t.closePaneLocked(ev.PaneID, now)
 }
 
 // ApplyAgentDetected records which agent holds a pane.
@@ -298,6 +403,10 @@ func (t *Tracker) ApplyPaneClosed(ev events.NormalizedEvent) {
 func (t *Tracker) ApplyAgentDetected(ev events.NormalizedEvent) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	if pane, ok := t.panes[ev.PaneID]; ok && !pane.ClosedAt.IsZero() {
+		slog.Debug("ignoring agent.detected for closing pane", "pane_id", ev.PaneID)
+		return
+	}
 	pane := t.panes[ev.PaneID]
 	pane.Agent = ev.Agent
 	pane.UpdatedAt = t.now()
@@ -314,6 +423,19 @@ func (t *Tracker) ApplyAgentStatusChanged(ev events.NormalizedEvent) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	now := t.now()
+
+	// A late status event for a pane/agent in its close grace window (2.7)
+	// must be absorbed, not applied: the entity's durations were flushed and
+	// counts decremented at close, so applying it would re-create a phantom
+	// that leaks a state count until the next re-baseline.
+	if pane, ok := t.panes[ev.PaneID]; ok && !pane.ClosedAt.IsZero() {
+		slog.Debug("ignoring late status change for closing pane", "pane_id", ev.PaneID)
+		return
+	}
+	if ag, ok := t.agents[ev.PaneID]; ok && !ag.ClosedAt.IsZero() {
+		slog.Debug("ignoring late status change for closing agent", "pane_id", ev.PaneID)
+		return
+	}
 
 	// Upsert: a status change may arrive for a pane whose created event was
 	// missed or which predates the subscription.
@@ -392,7 +514,11 @@ func (t *Tracker) ApplySeenFlip(paneID string) {
 	now := t.now()
 
 	ag, ok := t.agents[paneID]
-	if !ok || ag.Status != snapshot.AgentStatusDone {
+	// No-op when no longer tracked as `done` — a real status-changed event may
+	// have raced the reconcile diff and already closed the interval — or when
+	// the agent is in its close grace window (2.7), whose done interval was
+	// already flushed at close.
+	if !ok || ag.Status != snapshot.AgentStatusDone || !ag.ClosedAt.IsZero() {
 		return
 	}
 
@@ -546,6 +672,9 @@ func (t *Tracker) Diff(snap snapshot.Snapshot) DiffReport {
 		snapTabs[tab.TabID] = struct{}{}
 	}
 	for id := range t.tabs {
+		if !t.tabs[id].ClosedAt.IsZero() {
+			continue // in close grace window (2.7): intentionally absent from live tracking
+		}
 		if _, ok := snapTabs[id]; !ok {
 			drifts = append(drifts, Drift{Kind: "tab", ID: id, Tracked: "present"})
 		}
@@ -562,6 +691,9 @@ func (t *Tracker) Diff(snap snapshot.Snapshot) DiffReport {
 	}
 
 	for id, pane := range t.panes {
+		if !pane.ClosedAt.IsZero() {
+			continue // in close grace window (2.7): intentionally absent from live tracking
+		}
 		sp, ok := snapPanes[id]
 		if !ok {
 			drifts = append(drifts, Drift{Kind: "pane", ID: id, Tracked: describePaneTracked(pane)})

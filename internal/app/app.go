@@ -17,6 +17,12 @@ import (
 
 const maxInitialAttempts = 5
 
+// evictInterval is how often closed entities are swept from the tracker's
+// retention grace window (2.7). Tuned under DefaultGraceWindow (15s) so closed
+// entities are retained for [grace, grace+evictInterval) — long enough to
+// absorb late events, short enough to bound memory.
+const evictInterval = 5 * time.Second
+
 // App owns the subscription lifecycle. A single Tracker is shared between the
 // event loop (handleEvent) and the reconciliation watchdog (Run's diffing).
 type App struct {
@@ -72,6 +78,9 @@ func (a *App) Run(ctx context.Context) error {
 	}
 	go a.tr.Run(ctx, time.Minute, onReport)
 
+	evictTicker := time.NewTicker(evictInterval)
+	defer evictTicker.Stop()
+
 	slog.Info("subscribed; open/close a pane or drive an agent to see events (Ctrl-C to stop)")
 
 	for {
@@ -107,6 +116,12 @@ func (a *App) Run(ctx context.Context) error {
 			// Silent-stream guard (0.4): the socket is healthy but the event
 			// stream drifted from reality. Re-bootstrap and resubscribe.
 			a.reconnect(ctx)
+
+		case <-evictTicker.C:
+			// Bounded in-memory retention (2.7): drop closed panes/tabs/agents
+			// whose grace window has elapsed. Ran here on the event-loop
+			// goroutine so the tracker keeps its single-writer discipline.
+			a.tr.EvictExpired()
 
 		case <-ctx.Done():
 			slog.Info("shutting down")

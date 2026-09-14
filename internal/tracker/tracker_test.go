@@ -335,17 +335,39 @@ func TestApplyPaneClosedFlushesDoneInterval(t *testing.T) {
 		t.Fatal("no attention latency emitted on pane close while done")
 	}
 
+	// Within the grace window the records are retained (2.7), counts already
+	// decremented, durations freed.
+	tr.mu.RLock()
+	ag, agentOK := tr.agents["w1:p1"]
+	pane, paneOK := tr.panes["w1:p1"]
+	tr.mu.RUnlock()
+	if !agentOK || ag.ClosedAt.IsZero() {
+		t.Error("agent not retained with ClosedAt after close")
+	}
+	if ag.DurationByState != nil {
+		t.Errorf("DurationByState not freed at close: %+v", ag.DurationByState)
+	}
+	if !paneOK || pane.ClosedAt.IsZero() {
+		t.Error("pane not retained with ClosedAt after close")
+	}
+
+	// After the grace window the records are evicted.
+	cur = cur.Add(16 * time.Second)
+	tr.EvictExpired()
 	tr.mu.RLock()
 	_, agentGone := tr.agents["w1:p1"]
 	_, paneGone := tr.panes["w1:p1"]
 	tr.mu.RUnlock()
 	if agentGone || paneGone {
-		t.Error("pane/agent not removed after close")
+		t.Error("pane/agent still tracked after eviction")
 	}
 }
 
 func TestApplyPaneClosedForeignNoLatency(t *testing.T) {
+	cur := time.Date(2026, 9, 11, 12, 0, 0, 0, time.UTC)
 	tr := NewTracker()
+	tr.now = func() time.Time { return cur }
+
 	tr.ApplyAgentStatusChanged(events.NormalizedEvent{PaneID: "w1:p1", WorkspaceID: "w1", Agent: "codex", NewState: snapshot.AgentStatusWorking})
 	tr.ApplyPaneClosed(events.NormalizedEvent{PaneID: "w1:p1"})
 
@@ -353,6 +375,232 @@ func TestApplyPaneClosedForeignNoLatency(t *testing.T) {
 	case al := <-tr.AttentionLatency():
 		t.Errorf("closing a non-done pane emitted a sample: %+v", al)
 	default:
+	}
+
+	cur = cur.Add(16 * time.Second)
+	tr.EvictExpired()
+	tr.mu.RLock()
+	defer tr.mu.RUnlock()
+	if _, ok := tr.agents["w1:p1"]; ok {
+		t.Error("agent of closed pane still tracked after eviction")
+	}
+	if _, ok := tr.panes["w1:p1"]; ok {
+		t.Error("closed pane still tracked after eviction")
+	}
+}
+
+// TestLateStatusChangeIgnoredDuringGrace verifies 2.7's core purpose: a status
+// event arriving for a recently-closed pane is absorbed, not applied — it must
+// not resurrect a phantom agent, re-emit attention latency, or move the counts.
+func TestLateStatusChangeIgnoredDuringGrace(t *testing.T) {
+	cur := time.Date(2026, 9, 11, 12, 0, 0, 0, time.UTC)
+	tr := NewTracker()
+	tr.now = func() time.Time { return cur }
+
+	tr.ApplyAgentStatusChanged(events.NormalizedEvent{PaneID: "w1:p1", WorkspaceID: "w1", Agent: "codex", NewState: snapshot.AgentStatusDone})
+	cur = cur.Add(3 * time.Minute)
+	tr.ApplyPaneClosed(events.NormalizedEvent{PaneID: "w1:p1"})
+	<-tr.AttentionLatency() // drain the close flush
+
+	// Late event for the pane, still inside the grace window.
+	tr.ApplyAgentStatusChanged(events.NormalizedEvent{PaneID: "w1:p1", WorkspaceID: "w1", Agent: "codex", NewState: snapshot.AgentStatusWorking})
+
+	select {
+	case al := <-tr.AttentionLatency():
+		t.Errorf("late status change emitted a second sample: %+v", al)
+	default:
+	}
+	c := tr.Counts()
+	if got := c.Global[snapshot.AgentStatusWorking]; got != 0 {
+		t.Errorf("late status change re-counted a working agent: %d", got)
+	}
+
+	tr.mu.RLock()
+	ag, agentOK := tr.agents["w1:p1"]
+	pane, paneOK := tr.panes["w1:p1"]
+	tr.mu.RUnlock()
+	if !agentOK || ag.ClosedAt.IsZero() {
+		t.Fatal("agent not retained in grace window")
+	}
+	if ag.Status != snapshot.AgentStatusDone {
+		t.Errorf("late status change mutated retained agent status: %q", ag.Status)
+	}
+	if !paneOK || pane.ClosedAt.IsZero() {
+		t.Fatal("pane not retained in grace window")
+	}
+
+	cur = cur.Add(16 * time.Second)
+	tr.EvictExpired()
+	tr.mu.RLock()
+	defer tr.mu.RUnlock()
+	if _, ok := tr.agents["w1:p1"]; ok {
+		t.Error("agent still tracked after eviction")
+	}
+	if _, ok := tr.panes["w1:p1"]; ok {
+		t.Error("pane still tracked after eviction")
+	}
+}
+
+// TestWorkspaceClosedFlushesAttentionLatency verifies the 2.7 fix: closing a
+// workspace must flush done agents' attention-latency intervals, matching
+// ApplyPaneClosed/ApplyTabClosed — previously the interval was silently dropped.
+func TestWorkspaceClosedFlushesAttentionLatency(t *testing.T) {
+	cur := time.Date(2026, 9, 11, 12, 0, 0, 0, time.UTC)
+	tr := NewTracker()
+	tr.now = func() time.Time { return cur }
+
+	tr.ApplyPaneCreated(events.NormalizedEvent{PaneID: "w1:p1", WorkspaceID: "w1", TabID: "w1:t1"})
+	tr.ApplyAgentStatusChanged(events.NormalizedEvent{PaneID: "w1:p1", WorkspaceID: "w1", Agent: "codex", NewState: snapshot.AgentStatusDone})
+	cur = cur.Add(5 * time.Minute)
+	tr.ApplyWorkspaceClosed(events.NormalizedEvent{WorkspaceID: "w1"})
+
+	select {
+	case al := <-tr.AttentionLatency():
+		if al.Duration != 5*time.Minute {
+			t.Errorf("workspace-close attention latency = %s, want 5m", al.Duration)
+		}
+		if al.PaneID != "w1:p1" || al.WorkspaceID != "w1" {
+			t.Errorf("workspace-close latency metadata = %+v", al)
+		}
+	default:
+		t.Fatal("workspace close dropped a done agent's attention-latency interval")
+	}
+}
+
+// TestClosedAgentIgnoresSeenFlipDuringGrace verifies a stale reconcile-driven
+// seen-flip for a pane closed within its grace window is a no-op: the done
+// interval was already flushed at close, so it must not emit again.
+func TestClosedAgentIgnoresSeenFlipDuringGrace(t *testing.T) {
+	cur := time.Date(2026, 9, 11, 12, 0, 0, 0, time.UTC)
+	tr := NewTracker()
+	tr.now = func() time.Time { return cur }
+
+	tr.ApplyAgentStatusChanged(events.NormalizedEvent{PaneID: "w1:p1", WorkspaceID: "w1", Agent: "codex", NewState: snapshot.AgentStatusDone})
+	cur = cur.Add(time.Minute)
+	tr.ApplyPaneClosed(events.NormalizedEvent{PaneID: "w1:p1"})
+	<-tr.AttentionLatency() // drain the close flush
+
+	tr.ApplySeenFlip("w1:p1")
+
+	select {
+	case al := <-tr.AttentionLatency():
+		t.Errorf("seen-flip on closing agent emitted a sample: %+v", al)
+	default:
+	}
+	c := tr.Counts()
+	if got := c.Global[snapshot.AgentStatusIdle]; got != 0 {
+		t.Errorf("seen-flip on closing agent counted idle: %d", got)
+	}
+}
+
+// TestTabClosedThenWorkspaceClosedCascadesOnce verifies 2.7's cascade
+// idempotency where it matters most: closing a workspace's last tab emits
+// tab.closed followed immediately by workspace.closed (findings #8). Both
+// cascades overlap, so the done agent's attention-latency interval and count
+// decrement must happen exactly once.
+func TestTabClosedThenWorkspaceClosedCascadesOnce(t *testing.T) {
+	cur := time.Date(2026, 9, 11, 12, 0, 0, 0, time.UTC)
+	tr := NewTracker()
+	tr.now = func() time.Time { return cur }
+
+	tr.ApplyWorkspaceCreated(events.NormalizedEvent{WorkspaceID: "w1"})
+	tr.ApplyTabCreated(events.NormalizedEvent{TabID: "w1:t1", WorkspaceID: "w1"})
+	tr.ApplyPaneCreated(events.NormalizedEvent{PaneID: "w1:p1", WorkspaceID: "w1", TabID: "w1:t1"})
+	tr.ApplyAgentStatusChanged(events.NormalizedEvent{PaneID: "w1:p1", WorkspaceID: "w1", Agent: "codex", NewState: snapshot.AgentStatusDone})
+	cur = cur.Add(4 * time.Minute)
+
+	tr.ApplyTabClosed(events.NormalizedEvent{TabID: "w1:t1", WorkspaceID: "w1"})
+	tr.ApplyWorkspaceClosed(events.NormalizedEvent{WorkspaceID: "w1"})
+
+	select {
+	case al := <-tr.AttentionLatency():
+		if al.Duration != 4*time.Minute {
+			t.Errorf("attention latency = %s, want 4m", al.Duration)
+		}
+	default:
+		t.Fatal("no attention latency emitted across the double cascade")
+	}
+	select {
+	case al := <-tr.AttentionLatency():
+		t.Errorf("second cascade emitted a duplicate sample: %+v", al)
+	default:
+	}
+
+	c := tr.Counts()
+	if got := c.Global[snapshot.AgentStatusDone]; got != 0 {
+		t.Errorf("done count = %d, want 0", got)
+	}
+	if _, ok := c.Workspace["w1"]; ok {
+		t.Error("w1 count bucket survived a double cascade")
+	}
+
+	tr.mu.RLock()
+	ag, present := tr.agents["w1:p1"]
+	tr.mu.RUnlock()
+	if !present || ag.ClosedAt.IsZero() {
+		t.Fatal("agent of double-cascaded pane not retained in grace window")
+	}
+
+	cur = cur.Add(16 * time.Second)
+	tr.EvictExpired()
+	tr.mu.RLock()
+	defer tr.mu.RUnlock()
+	if _, ok := tr.agents["w1:p1"]; ok {
+		t.Error("agent still tracked after eviction")
+	}
+	if _, ok := tr.panes["w1:p1"]; ok {
+		t.Error("pane still tracked after eviction")
+	}
+	if _, ok := tr.tabs["w1:t1"]; ok {
+		t.Error("tab still tracked after eviction")
+	}
+}
+
+// TestDiffSkipsClosedEntitiesInGrace verifies closed panes/tabs inside their
+// retention window don't surface as drift against a stale snapshot — they are
+// intentionally absent from live tracking until eviction (2.7).
+func TestDiffSkipsClosedEntitiesInGrace(t *testing.T) {
+	snap := snapshot.Snapshot{
+		Workspaces: []snapshot.Workspace{{WorkspaceID: "w1"}},
+		Tabs:       []snapshot.Tab{{TabID: "w1:t1", WorkspaceID: "w1"}},
+		Panes:      workingPanes(""),
+	}
+	tr := NewTracker()
+	tr.ApplySnapshot(snap)
+
+	tr.ApplyPaneClosed(events.NormalizedEvent{PaneID: "w1:p1"})
+	tr.ApplyTabClosed(events.NormalizedEvent{TabID: "w1:t1", WorkspaceID: "w1"})
+
+	if report := tr.Diff(snap); report.Drifted() {
+		t.Errorf("closed entities in grace window drifted: %+v", report.Drifts)
+	}
+}
+
+// TestClosedEntitiesClearedByRebaseline verifies a re-baseline wipes retained
+// close-grace records immediately: the snapshot is ground truth and never
+// contains a genuinely closed entity, so there is no need to wait for the
+// grace window.
+func TestClosedEntitiesClearedByRebaseline(t *testing.T) {
+	cur := time.Date(2026, 9, 11, 12, 0, 0, 0, time.UTC)
+	tr := NewTracker()
+	tr.now = func() time.Time { return cur }
+
+	agent := "codex"
+	tr.ApplySnapshot(snapshot.Snapshot{
+		Panes: []snapshot.Pane{{PaneID: "w1:p1", WorkspaceID: "w1", TabID: "w1:t1", AgentStatus: snapshot.AgentStatusDone, Agent: &agent}},
+	})
+	tr.ApplyPaneClosed(events.NormalizedEvent{PaneID: "w1:p1"})
+	<-tr.AttentionLatency() // drain close flush
+
+	tr.ApplySnapshot(snapshot.Snapshot{Workspaces: []snapshot.Workspace{{WorkspaceID: "w1"}}})
+
+	tr.mu.RLock()
+	defer tr.mu.RUnlock()
+	if _, ok := tr.panes["w1:p1"]; ok {
+		t.Error("closed pane survived a re-baseline that omits it")
+	}
+	if _, ok := tr.agents["w1:p1"]; ok {
+		t.Error("closed agent survived a re-baseline that omits it")
 	}
 }
 
@@ -546,22 +794,41 @@ func TestApplySnapshotSeedsAndResetsAgents(t *testing.T) {
 }
 
 func TestApplyWorkspaceClosedCascades(t *testing.T) {
+	cur := time.Date(2026, 9, 11, 12, 0, 0, 0, time.UTC)
 	tr := NewTracker()
+	tr.now = func() time.Time { return cur }
+
 	tr.ApplyWorkspaceCreated(events.NormalizedEvent{WorkspaceID: "w1"})
 	tr.ApplyPaneCreated(events.NormalizedEvent{PaneID: "w1:p1", WorkspaceID: "w1", TabID: "w1:t1"})
 	tr.ApplyWorkspaceClosed(events.NormalizedEvent{WorkspaceID: "w1"})
 
 	tr.mu.RLock()
-	defer tr.mu.RUnlock()
+	_, wsPresent := tr.workspaces["w1"]
+	pane, paneOK := tr.panes["w1:p1"]
+	tab, tabOK := tr.tabs["w1:t1"]
+	tr.mu.RUnlock()
 
-	if _, ok := tr.workspaces["w1"]; ok {
+	if wsPresent {
 		t.Error("workspace w1 still tracked after close")
 	}
+	// The cascade previously deleted immediately; now the entities enter the
+	// retention grace window (2.7) so late events are absorbed.
+	if !paneOK || pane.ClosedAt.IsZero() {
+		t.Error("pane w1:p1 not retained with ClosedAt after workspace close")
+	}
+	if !tabOK || tab.ClosedAt.IsZero() {
+		t.Error("tab w1:t1 not retained with ClosedAt after workspace close")
+	}
+
+	cur = cur.Add(16 * time.Second)
+	tr.EvictExpired()
+	tr.mu.RLock()
+	defer tr.mu.RUnlock()
 	if _, ok := tr.panes["w1:p1"]; ok {
-		t.Error("pane w1:p1 still tracked after workspace close")
+		t.Error("pane w1:p1 still tracked after eviction")
 	}
 	if _, ok := tr.tabs["w1:t1"]; ok {
-		t.Error("tab w1:t1 still tracked after workspace close")
+		t.Error("tab w1:t1 still tracked after eviction")
 	}
 }
 
@@ -658,14 +925,28 @@ func TestDiffDetectsRemovedPane(t *testing.T) {
 		Panes:      workingPanes(""),
 	}
 
+	cur := time.Date(2026, 9, 11, 12, 0, 0, 0, time.UTC)
 	tr := NewTracker()
+	tr.now = func() time.Time { return cur }
 	tr.ApplySnapshot(snap)
-	// Pane closed in the stream, but the snapshot still lists it -> drift.
+	// Pane closed in the stream, but the snapshot it was built from still
+	// lists it (2.7). Within the retention grace window that is a known
+	// transitional state, not a drift: the pane is genuinely closed, so
+	// nothing is missing on the stream's side and no resubscribe is warranted.
 	tr.ApplyPaneClosed(events.NormalizedEvent{PaneID: "w1:p1"})
+
+	if report := tr.Diff(snap); report.Drifted() {
+		t.Fatalf("closed pane in grace window must not drift: %+v", report.Drifts)
+	}
+
+	// Once the grace window elapses the pane is evicted, and a snapshot that
+	// still lists it is a genuine removed-pane gap -> drift.
+	cur = cur.Add(16 * time.Second)
+	tr.EvictExpired()
 
 	report := tr.Diff(snap)
 	if !report.Drifted() {
-		t.Fatal("expected drift for removed pane")
+		t.Fatal("expected drift for removed pane after eviction")
 	}
 	if report.Drifts[0].Kind != "pane" || report.Drifts[0].ID != "w1:p1" {
 		t.Errorf("drifts = %+v", report.Drifts)
@@ -740,7 +1021,10 @@ func TestDiffIgnoresTabMetadataChanges(t *testing.T) {
 }
 
 func TestApplyTabLifecycleTracksState(t *testing.T) {
+	cur := time.Date(2026, 9, 11, 12, 0, 0, 0, time.UTC)
 	tr := NewTracker()
+	tr.now = func() time.Time { return cur }
+
 	tr.ApplyTabCreated(events.NormalizedEvent{TabID: "w1:t1", WorkspaceID: "w1", Label: "herdr-scribe"})
 
 	tr.mu.RLock()
@@ -760,10 +1044,21 @@ func TestApplyTabLifecycleTracksState(t *testing.T) {
 
 	tr.ApplyTabClosed(events.NormalizedEvent{TabID: "w1:t1", WorkspaceID: "w1"})
 	tr.mu.RLock()
-	_, gone := tr.tabs["w1:t1"]
+	tab, ok := tr.tabs["w1:t1"]
 	tr.mu.RUnlock()
-	if gone {
-		t.Error("tab still tracked after close")
+	if !ok {
+		t.Fatal("tab evicted before its grace window")
+	}
+	if tab.ClosedAt.IsZero() {
+		t.Error("tab not marked closed after tab.closed")
+	}
+
+	cur = cur.Add(16 * time.Second)
+	tr.EvictExpired()
+	tr.mu.RLock()
+	defer tr.mu.RUnlock()
+	if _, still := tr.tabs["w1:t1"]; still {
+		t.Error("tab still tracked after eviction")
 	}
 }
 
@@ -795,24 +1090,59 @@ func TestApplyTabClosedCascadesPanesAndAgents(t *testing.T) {
 	}
 
 	tr.mu.RLock()
-	defer tr.mu.RUnlock()
-	if _, ok := tr.tabs["w1:t1"]; ok {
-		t.Error("tab w1:t1 still tracked")
-	}
+	tab1, t1OK := tr.tabs["w1:t1"]
 	if _, ok := tr.tabs["w1:t2"]; !ok {
 		t.Error("tab w1:t2 must survive the cascade")
 	}
+	p1, p1OK := tr.panes["w1:p1"]
+	ag1, ag1OK := tr.agents["w1:p1"]
+	p2, p2OK := tr.panes["w1:p2"]
+	_, ag2OK := tr.agents["w1:p2"]
+	if _, ok := tr.panes["w1:p3"]; !ok {
+		t.Error("pane w1:p3 (other tab) must survive")
+	}
+	tr.mu.RUnlock()
+
+	// The cascaded entities enter the retention grace window (2.7): retained
+	// with ClosedAt until eviction, not deleted on the spot.
+	if !t1OK || tab1.ClosedAt.IsZero() {
+		t.Error("tab w1:t1 not retained with ClosedAt after close")
+	}
+	if !p1OK || p1.ClosedAt.IsZero() {
+		t.Error("pane w1:p1 not retained with ClosedAt after close")
+	}
+	if !ag1OK || ag1.ClosedAt.IsZero() {
+		t.Error("agent w1:p1 not retained with ClosedAt after close")
+	}
+	if !p2OK || p2.ClosedAt.IsZero() {
+		t.Error("pane w1:p2 not retained with ClosedAt after close")
+	}
+	if !ag2OK {
+		t.Error("agent w1:p2 not retained after close")
+	}
+
+	cur = cur.Add(16 * time.Second)
+	tr.EvictExpired()
+
+	tr.mu.RLock()
+	defer tr.mu.RUnlock()
+	if _, ok := tr.tabs["w1:t1"]; ok {
+		t.Error("tab w1:t1 still tracked after eviction")
+	}
+	if _, ok := tr.tabs["w1:t2"]; !ok {
+		t.Error("tab w1:t2 must survive")
+	}
 	if _, ok := tr.panes["w1:p1"]; ok {
-		t.Error("pane w1:p1 still tracked after tab close")
+		t.Error("pane w1:p1 still tracked after eviction")
 	}
 	if _, ok := tr.agents["w1:p1"]; ok {
-		t.Error("agent w1:p1 still tracked after tab close")
+		t.Error("agent w1:p1 still tracked after eviction")
 	}
 	if _, ok := tr.panes["w1:p2"]; ok {
-		t.Error("pane w1:p2 still tracked after tab close")
+		t.Error("pane w1:p2 still tracked after eviction")
 	}
 	if _, ok := tr.agents["w1:p2"]; ok {
-		t.Error("agent w1:p2 still tracked after tab close")
+		t.Error("agent w1:p2 still tracked after eviction")
 	}
 	if _, ok := tr.panes["w1:p3"]; !ok {
 		t.Error("pane w1:p3 (other tab) must survive")
