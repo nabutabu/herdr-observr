@@ -58,6 +58,20 @@ const (
 	DurationMetricName = "herdr.agent.state.duration"
 )
 
+// (3.5) herdr.agent.attention_latency — a histogram of closed done-but-unseen
+// intervals (2.4), recorded once each time an agent stops being done: the
+// elapsed "waiting for a human" time. Deliberately separate from 3.4's generic
+// state duration — time in done is one thing, done-and-unseen dwell is the
+// alertable metric (e.g. "agent has been waiting for 20+ minutes").
+//
+// Tagged by agent.type only. Unlike 3.4 there is no state attribute: this
+// metric's state is always `done` by construction, so a state dimension would
+// be a constant. Bounded cardinality, no pane/workspace id.
+const (
+	// AttentionLatencyMetricName is the 3.5 histogram metric name.
+	AttentionLatencyMetricName = "herdr.agent.attention_latency"
+)
+
 // NewMeterProvider initializes the OTel metrics SDK with the OTLP/gRPC
 // exporter and associates it with res.
 //
@@ -129,5 +143,19 @@ func NewDurationHistogram(meter apimetric.Meter) (apimetric.Float64Histogram, er
 		DurationMetricName,
 		apimetric.WithUnit("s"),
 		apimetric.WithDescription("Closed agent state interval durations, tagged by agent type and state"),
+	)
+}
+
+// NewAttentionLatencyHistogram registers herdr.agent.attention_latency (3.5)
+// on meter and returns it, or an error if registration failed. The returned
+// histogram is a no-op when the meter itself is a no-op (telemetry disabled).
+// These are closed done-but-unseen intervals, recorded in seconds (unit "s"),
+// one sample each time an agent leaves done. Tagged by agent type only; the
+// state is always done by construction, so no state attribute participates.
+func NewAttentionLatencyHistogram(meter apimetric.Meter) (apimetric.Float64Histogram, error) {
+	return meter.Float64Histogram(
+		AttentionLatencyMetricName,
+		apimetric.WithUnit("s"),
+		apimetric.WithDescription("Closed done-but-unseen (attention latency) intervals, tagged by agent type"),
 	)
 }

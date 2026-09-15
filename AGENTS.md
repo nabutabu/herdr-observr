@@ -355,6 +355,18 @@ Implemented and tested, as of the current `main` branch:
   design — polling the tracker's live records (as an earlier note here and in
   `types.go` had anticipated) would have sampled open interval ages instead
   of completed durations, and `DurationByState` is freed at close anyway.
+- **3.5** — `herdr.agent.attention_latency` histogram
+  (`internal/otel/meter.go`'s `AttentionLatencyMetricName`,
+  `NewAttentionLatencyHistogram`, unit `s`; `Telemetry` registers it via
+  `registerAttentionLatency`/`recordAttentionLatency`). The tracker's
+  `AttentionLatency()` channel (2.4) — emitted by `ApplyAgentStatusChanged`,
+  `ApplySeenFlip`, and the close-time flush in `closeAgentLocked` — is now
+  recorded as a *closed* done-but-unseen interval histogram, separate from
+  3.4's generic state duration so it can be alerted on independently. Tagged
+  `herdr.agent.type` only: the interval's state is `done` by construction, so
+  no state attribute participates (unlike 3.4); bounded cardinality by
+  construction. `app.Run` still keeps a `slog.Debug` on each close for local
+  troubleshooting.
 
 **Not yet implemented** — confirmed by `grep`, not just absence from this
 list:
@@ -365,10 +377,8 @@ list:
   *within* a running process — it does not protect against the process
   itself crashing (finding #1). This is the top open item.
 - **Phase 3 (OTel/OTLP export)** — 3.1, 3.2 (resource attributes), **3.3**,
-  and **3.4** landed (see above); **3.5–3.9 not implemented**:
-  `AttentionLatency()` results are still only logged in `app.Run` (see the
-  `// Phase 3.5 replaces this log` comment there); `Tracker.Counts()` is
-  implemented but nothing reads it yet.
+  **3.4**, and **3.5** landed (see above); **3.6–3.9 not implemented**:
+  `Tracker.Counts()` is implemented but nothing reads it yet.
 - **Phase 4 (plugin packaging)** — no `herdr-plugin.toml` in the repo.
 - **Phases 5–6** — reliability hardening and the local demo stack.
 

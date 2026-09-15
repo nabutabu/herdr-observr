@@ -124,6 +124,21 @@ func drainStateDurations(t *testing.T, a *App) {
 	}
 }
 
+// drainAttentionLatency replicates Run's select-case consumer, forwarding each
+// closed attention-latency interval to the histogram exactly as production
+// does.
+func drainAttentionLatency(t *testing.T, a *App) {
+	t.Helper()
+	for {
+		select {
+		case al := <-a.tr.AttentionLatency():
+			a.telemetry.recordAttentionLatency(al)
+		default:
+			return
+		}
+	}
+}
+
 func findInt64SumPoints(t *testing.T, rm metricdata.ResourceMetrics, name string) []metricdata.DataPoint[int64] {
 	t.Helper()
 	var out []metricdata.DataPoint[int64]
@@ -356,6 +371,105 @@ func TestRecordStateDurationNoopWithoutTelemetry(t *testing.T) {
 	a := &App{tr: tracker.NewTracker()}
 	sd := tracker.StateDuration{PaneID: "w1:p1", WorkspaceID: "w1", Agent: "codex", State: snapshot.AgentStatusWorking}
 	a.telemetry.recordStateDuration(sd)
+}
+
+func TestRecordAttentionLatencyHistogramEventDriven(t *testing.T) {
+	reader := metric.NewManualReader()
+	mp := otel.NewMeterProviderWithReader(reader, resource.NewSchemaless(attribute.String("service.name", "test")))
+	defer func() { _ = mp.Shutdown(context.Background()) }()
+
+	a := &App{telemetry: &Telemetry{meter: mp.Meter(otel.MeterName)}, tr: tracker.NewTracker()}
+	a.telemetry.registerAttentionLatency()
+	if a.telemetry.attentionLatencyHistogram == nil {
+		t.Fatal("registerAttentionLatencyHistogram did not create the histogram")
+	}
+
+	// Entering done on a first-seen upsert starts the clock but emits nothing;
+	// leaving done via a real status event closes and emits the interval.
+	a.handleEvent(statusEv(snapshot.AgentStatusDone))
+	a.handleEvent(statusEv(snapshot.AgentStatusIdle))
+	drainAttentionLatency(t, a)
+
+	var rm metricdata.ResourceMetrics
+	if err := reader.Collect(context.Background(), &rm); err != nil {
+		t.Fatalf("collect: %v", err)
+	}
+	points := findFloat64HistogramPoints(t, rm, otel.AttentionLatencyMetricName)
+	if len(points) != 1 {
+		t.Fatalf("attention-latency datapoints = %d, want 1 (entering done emits none)", len(points))
+	}
+	dp := points[0]
+	if dp.Count != 1 {
+		t.Errorf("count = %d, want 1", dp.Count)
+	}
+	if got := attrString(t, dp.Attributes, otel.AgentTypeKey); got != "codex" {
+		t.Errorf("agent.type = %q, want codex", got)
+	}
+	if _, ok := dp.Attributes.Value(attribute.Key(otel.AgentStateKey)); ok {
+		t.Errorf("state attribute present on attention latency; it is done-only by construction")
+	}
+}
+
+func TestRecordAttentionLatencyHistogramSeenFlip(t *testing.T) {
+	reader := metric.NewManualReader()
+	mp := otel.NewMeterProviderWithReader(reader, resource.NewSchemaless(attribute.String("service.name", "test")))
+	defer func() { _ = mp.Shutdown(context.Background()) }()
+
+	a := &App{telemetry: &Telemetry{meter: mp.Meter(otel.MeterName)}, tr: tracker.NewTracker()}
+	a.telemetry.registerAttentionLatency()
+
+	// The silent reconcile-detected close path (2.4): done is flip-flopped to
+	// idle by ApplySeenFlip, closing the attention-latency interval.
+	a.handleEvent(statusEv(snapshot.AgentStatusDone))
+	a.tr.ApplySeenFlip("w1:p1")
+	drainAttentionLatency(t, a)
+
+	var rm metricdata.ResourceMetrics
+	if err := reader.Collect(context.Background(), &rm); err != nil {
+		t.Fatalf("collect: %v", err)
+	}
+	points := findFloat64HistogramPoints(t, rm, otel.AttentionLatencyMetricName)
+	if len(points) != 1 {
+		t.Fatalf("attention-latency datapoints = %d, want 1", len(points))
+	}
+	if got := attrString(t, points[0].Attributes, otel.AgentTypeKey); got != "codex" {
+		t.Errorf("agent.type = %q, want codex", got)
+	}
+}
+
+func TestRecordAttentionLatencyHistogramCloseFlush(t *testing.T) {
+	reader := metric.NewManualReader()
+	mp := otel.NewMeterProviderWithReader(reader, resource.NewSchemaless(attribute.String("service.name", "test")))
+	defer func() { _ = mp.Shutdown(context.Background()) }()
+
+	a := &App{telemetry: &Telemetry{meter: mp.Meter(otel.MeterName)}, tr: tracker.NewTracker()}
+	a.telemetry.registerAttentionLatency()
+
+	// Closing a pane while its agent is still done flushes the open
+	// attention-latency interval (2.7 flush-on-close).
+	a.handleEvent(statusEv(snapshot.AgentStatusDone))
+	a.handleEvent(events.NormalizedEvent{Kind: events.KindPaneClosed, PaneID: "w1:p1"})
+	drainAttentionLatency(t, a)
+
+	var rm metricdata.ResourceMetrics
+	if err := reader.Collect(context.Background(), &rm); err != nil {
+		t.Fatalf("collect: %v", err)
+	}
+	points := findFloat64HistogramPoints(t, rm, otel.AttentionLatencyMetricName)
+	if len(points) != 1 {
+		t.Fatalf("attention-latency datapoints = %d, want 1", len(points))
+	}
+	if got := attrString(t, points[0].Attributes, otel.AgentTypeKey); got != "codex" {
+		t.Errorf("agent.type = %q, want codex", got)
+	}
+}
+
+func TestRecordAttentionLatencyNoopWithoutTelemetry(t *testing.T) {
+	// Telemetry disabled (nil histogram): consuming closed intervals must be a
+	// no-op, never a panic or block.
+	a := &App{tr: tracker.NewTracker()}
+	al := tracker.AttentionLatency{PaneID: "w1:p1", WorkspaceID: "w1", Agent: "codex"}
+	a.telemetry.recordAttentionLatency(al)
 }
 
 func TestHandleEventRoutesTabKinds(t *testing.T) {

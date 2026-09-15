@@ -32,6 +32,11 @@ type Telemetry struct {
 	// no-ops.
 	stateDurationHistogram metric.Float64Histogram
 
+	// attentionLatencyHistogram is the herdr.agent.attention_latency histogram
+	// (3.5), defined only when telemetry initialized. Nil means
+	// recordAttentionLatency no-ops.
+	attentionLatencyHistogram metric.Float64Histogram
+
 	// shutdown flushes and closes the MeterProvider. Nil when the SDK never
 	// initialized.
 	shutdown func(context.Context) error
@@ -61,6 +66,7 @@ func NewTelemetry(ctx context.Context) *Telemetry {
 	t.registerUp()
 	t.registerTransitions()
 	t.registerStateDurations()
+	t.registerAttentionLatency()
 	return t
 }
 
@@ -152,6 +158,36 @@ func (t *Telemetry) recordStateDuration(sd tracker.StateDuration) {
 		metric.WithAttributes(
 			attribute.String(otel.AgentTypeKey, sd.Agent),
 			attribute.String(otel.AgentStateKey, string(sd.State)),
+		),
+	)
+}
+
+// registerAttentionLatency registers the 3.5 herdr.agent.attention_latency
+// histogram. Registration failure (e.g. a stale meter) disables the histogram,
+// never the subscription.
+func (t *Telemetry) registerAttentionLatency() {
+	if t.meter == nil {
+		return
+	}
+	hist, err := otel.NewAttentionLatencyHistogram(t.meter)
+	if err != nil {
+		slog.Warn("registering "+otel.AttentionLatencyMetricName+" failed", "error", err)
+		return
+	}
+	t.attentionLatencyHistogram = hist
+}
+
+// recordAttentionLatency records one herdr.agent.attention_latency histogram
+// sample for a closed done-but-unseen interval, tagged by agent.type. A nil
+// Telemetry or histogram (telemetry disabled or registration failed) is a
+// no-op. Durations are recorded in seconds per the instrument unit (3.5).
+func (t *Telemetry) recordAttentionLatency(al tracker.AttentionLatency) {
+	if t == nil || t.attentionLatencyHistogram == nil {
+		return
+	}
+	t.attentionLatencyHistogram.Record(context.Background(), al.Duration.Seconds(),
+		metric.WithAttributes(
+			attribute.String(otel.AgentTypeKey, al.Agent),
 		),
 	)
 }

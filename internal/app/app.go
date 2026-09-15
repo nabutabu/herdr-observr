@@ -119,8 +119,12 @@ func (a *App) Run(ctx context.Context) error {
 			a.reconnect(ctx)
 
 		case al := <-a.tr.AttentionLatency():
-			// Phase 3.5 replaces this log with an OTel histogram emission.
-			slog.Info("attention latency", "pane_id", al.PaneID, "agent", al.Agent, "duration", al.Duration)
+			// 3.5: each closed done-but-unseen interval records one
+			// herdr.agent.attention_latency histogram sample. Kept as a debug
+			// log for local troubleshooting now that the metric owns the
+			// signal.
+			a.telemetry.recordAttentionLatency(al)
+			slog.Debug("attention latency", "pane_id", al.PaneID, "agent", al.Agent, "duration", al.Duration)
 
 		case tr := <-a.tr.Transitions():
 			// 3.3: every genuine agent state transition increments the

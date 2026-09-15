@@ -133,6 +133,71 @@ func TestDurationHistogramRegistersAndRecords(t *testing.T) {
 	}
 }
 
+func TestAttentionLatencyHistogramRegistersAndRecords(t *testing.T) {
+	// (3.5) Pin the registered metric name, its unit, and the attribute shape:
+	// closed done-but-unseen intervals recorded in seconds, tagged by agent
+	// type only — no state attribute, since the state is done by construction.
+	setCleanEnv(t)
+
+	res, err := BuildResource(context.Background())
+	if err != nil {
+		t.Fatalf("BuildResource: %v", err)
+	}
+
+	reader := metric.NewManualReader()
+	mp := newMeterProviderWithReader(reader, res)
+	defer func() { _ = mp.Shutdown(context.Background()) }()
+
+	hist, err := NewAttentionLatencyHistogram(mp.Meter(MeterName))
+	if err != nil {
+		t.Fatalf("NewAttentionLatencyHistogram: %v", err)
+	}
+
+	hist.Record(context.Background(), 170.999,
+		otmetric.WithAttributes(
+			attribute.String(AgentTypeKey, "codex"),
+		),
+	)
+
+	var rm metricdata.ResourceMetrics
+	if err := reader.Collect(context.Background(), &rm); err != nil {
+		t.Fatalf("collect: %v", err)
+	}
+
+	found := false
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			if m.Name != AttentionLatencyMetricName {
+				continue
+			}
+			found = true
+			if m.Unit != "s" {
+				t.Errorf("unit = %q, want %q", m.Unit, "s")
+			}
+			h, ok := m.Data.(metricdata.Histogram[float64])
+			if !ok {
+				t.Fatalf("data type = %T, want Histogram[float64]", m.Data)
+			}
+			if len(h.DataPoints) != 1 {
+				t.Fatalf("datapoints = %d, want 1", len(h.DataPoints))
+			}
+			dp := h.DataPoints[0]
+			if dp.Count != 1 {
+				t.Errorf("count = %d, want 1", dp.Count)
+			}
+			if v, ok := dp.Attributes.Value(attribute.Key(AgentTypeKey)); !ok || v.AsString() != "codex" {
+				t.Errorf("agent.type attribute = %v (ok=%v), want codex", v, ok)
+			}
+			if _, ok := dp.Attributes.Value(attribute.Key(AgentStateKey)); ok {
+				t.Errorf("state attribute present on %q; attention latency is done-only", AttentionLatencyMetricName)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("metric %q not found in collected data", AttentionLatencyMetricName)
+	}
+}
+
 func TestNewMeterProviderWithUnreachableEndpoint(t *testing.T) {
 	// The gRPC connection is established lazily, so construction must succeed
 	// even when the collector is unreachable (Phase 5.4): exports fail and are
