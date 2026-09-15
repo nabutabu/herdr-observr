@@ -44,6 +44,20 @@ const (
 	AgentStateKey      = "herdr.agent.state"
 )
 
+// (3.4) herdr.agent.state.duration — a histogram of closed agent state
+// intervals, recorded once each time an agent leaves a state (2.3): the
+// working/blocked/idle (and done/unknown) duration metric. Tagged by agent
+// type and the state whose interval just closed. It shares AgentTypeKey and
+// AgentStateKey with the 3.3 counter; bounded cardinality by construction.
+//
+// Deliberately separate from attention latency (3.5): "time in done" is a
+// generic state duration like any other, while the done-but-unseen dwell time
+// is its own alertable metric and gets its own histogram.
+const (
+	// DurationMetricName is the 3.4 histogram metric name.
+	DurationMetricName = "herdr.agent.state.duration"
+)
+
 // NewMeterProvider initializes the OTel metrics SDK with the OTLP/gRPC
 // exporter and associates it with res.
 //
@@ -103,5 +117,17 @@ func NewTransitionCounter(meter apimetric.Meter) (apimetric.Int64Counter, error)
 		TransitionMetricName,
 		apimetric.WithUnit("1"),
 		apimetric.WithDescription("Count of genuine agent state transitions, tagged by agent type and previous/new state"),
+	)
+}
+
+// NewDurationHistogram registers herdr.agent.state.duration (3.4) on meter and
+// returns it, or an error if registration failed. The returned histogram is a
+// no-op when the meter itself is a no-op (telemetry disabled). Durations are
+// recorded in seconds (unit "s"), one sample per closed state interval.
+func NewDurationHistogram(meter apimetric.Meter) (apimetric.Float64Histogram, error) {
+	return meter.Float64Histogram(
+		DurationMetricName,
+		apimetric.WithUnit("s"),
+		apimetric.WithDescription("Closed agent state interval durations, tagged by agent type and state"),
 	)
 }

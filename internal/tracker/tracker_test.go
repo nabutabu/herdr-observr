@@ -337,6 +337,26 @@ func assertNoTransition(t *testing.T, tr *Tracker) {
 	}
 }
 
+func nextStateDuration(t *testing.T, tr *Tracker) StateDuration {
+	t.Helper()
+	select {
+	case sd := <-tr.StateDurations():
+		return sd
+	default:
+		t.Fatal("no state duration emitted")
+		return StateDuration{}
+	}
+}
+
+func assertNoStateDuration(t *testing.T, tr *Tracker) {
+	t.Helper()
+	select {
+	case sd := <-tr.StateDurations():
+		t.Errorf("unexpected state duration emitted: %+v", sd)
+	default:
+	}
+}
+
 func TestTransitionsOnStatusChange(t *testing.T) {
 	cur := time.Date(2026, 9, 11, 12, 0, 0, 0, time.UTC)
 	tr := NewTracker()
@@ -438,6 +458,145 @@ func TestTransitionsEmittedOnSeenFlip(t *testing.T) {
 	cur = cur.Add(time.Minute)
 	tr.ApplySeenFlip("w1:p1")
 	assertNoTransition(t, tr)
+}
+
+func TestStateDurationEmittedOnStatusChange(t *testing.T) {
+	cur := time.Date(2026, 9, 11, 12, 0, 0, 0, time.UTC)
+	tr := NewTracker()
+	tr.now = func() time.Time { return cur }
+	change := func(s snapshot.AgentStatus) {
+		tr.ApplyAgentStatusChanged(events.NormalizedEvent{PaneID: "w1:p1", WorkspaceID: "w1", Agent: "codex", NewState: s})
+	}
+
+	// First-seen upsert opens the interval with no prior state to close.
+	change(snapshot.AgentStatusWorking)
+	assertNoStateDuration(t, tr)
+
+	cur = cur.Add(2 * time.Minute)
+	change(snapshot.AgentStatusBlocked)
+
+	sd := nextStateDuration(t, tr)
+	if sd.State != snapshot.AgentStatusWorking || sd.Duration != 2*time.Minute {
+		t.Errorf("state duration = %+v, want working for 2m", sd)
+	}
+	if sd.Agent != "codex" || sd.PaneID != "w1:p1" || sd.WorkspaceID != "w1" {
+		t.Errorf("state duration identity = %+v", sd)
+	}
+	if sd.ObservedAt != cur {
+		t.Errorf("state duration ObservedAt = %v, want %v", sd.ObservedAt, cur)
+	}
+
+	cur = cur.Add(3 * time.Minute)
+	change(snapshot.AgentStatusWorking)
+
+	sd = nextStateDuration(t, tr)
+	if sd.State != snapshot.AgentStatusBlocked || sd.Duration != 3*time.Minute {
+		t.Errorf("state duration = %+v, want blocked for 3m", sd)
+	}
+	assertNoStateDuration(t, tr)
+}
+
+func TestStateDurationEmittedOnSeenFlip(t *testing.T) {
+	cur := time.Date(2026, 9, 11, 12, 0, 0, 0, time.UTC)
+	tr := NewTracker()
+	tr.now = func() time.Time { return cur }
+
+	tr.ApplyAgentStatusChanged(events.NormalizedEvent{PaneID: "w1:p1", WorkspaceID: "w1", Agent: "codex", NewState: snapshot.AgentStatusDone})
+	assertNoStateDuration(t, tr) // entering done from unknown is a first-seen, not a close
+
+	cur = cur.Add(4 * time.Minute)
+	tr.ApplySeenFlip("w1:p1")
+
+	sd := nextStateDuration(t, tr)
+	if sd.State != snapshot.AgentStatusDone || sd.Duration != 4*time.Minute {
+		t.Errorf("seen-flip state duration = %+v, want done for 4m", sd)
+	}
+	<-tr.AttentionLatency() // drain the separate done-close sample
+
+	// A second flip for an agent no longer done is a no-op: no duration.
+	cur = cur.Add(time.Minute)
+	tr.ApplySeenFlip("w1:p1")
+	assertNoStateDuration(t, tr)
+}
+
+func TestStateDurationEmittedOnCloseFlush(t *testing.T) {
+	cur := time.Date(2026, 9, 11, 12, 0, 0, 0, time.UTC)
+	tr := NewTracker()
+	tr.now = func() time.Time { return cur }
+
+	tr.ApplyAgentStatusChanged(events.NormalizedEvent{PaneID: "w1:p1", WorkspaceID: "w1", Agent: "codex", NewState: snapshot.AgentStatusWorking})
+	cur = cur.Add(2 * time.Minute)
+	tr.ApplyPaneClosed(events.NormalizedEvent{PaneID: "w1:p1"})
+
+	sd := nextStateDuration(t, tr)
+	if sd.State != snapshot.AgentStatusWorking || sd.Duration != 2*time.Minute {
+		t.Errorf("close-flush state duration = %+v, want working for 2m", sd)
+	}
+}
+
+func TestStateDurationNotEmittedOnSameState(t *testing.T) {
+	tr := NewTracker()
+	change := func(s snapshot.AgentStatus) {
+		tr.ApplyAgentStatusChanged(events.NormalizedEvent{PaneID: "w1:p1", WorkspaceID: "w1", Agent: "codex", NewState: s})
+	}
+
+	change(snapshot.AgentStatusWorking) // first-seen
+	change(snapshot.AgentStatusWorking) // duplicate: idempotency no-op
+	assertNoStateDuration(t, tr)
+
+	change(snapshot.AgentStatusBlocked)
+	if sd := nextStateDuration(t, tr); sd.State != snapshot.AgentStatusWorking {
+		t.Errorf("state duration = %+v, want a single working close", sd)
+	}
+	assertNoStateDuration(t, tr)
+}
+
+func TestStateDurationNotEmittedOnSnapshotBaseline(t *testing.T) {
+	tr := NewTracker()
+	agent := "codex"
+	tr.ApplySnapshot(snapshot.Snapshot{
+		Panes: []snapshot.Pane{{PaneID: "w1:p1", WorkspaceID: "w1", TabID: "w1:t1", AgentStatus: snapshot.AgentStatusWorking, Agent: &agent}},
+	})
+	// Re-baseline seeding establishes current state; it closes no interval.
+	assertNoStateDuration(t, tr)
+}
+
+func TestStateDurationNotEmittedOnLateStatusInGrace(t *testing.T) {
+	cur := time.Date(2026, 9, 11, 12, 0, 0, 0, time.UTC)
+	tr := NewTracker()
+	tr.now = func() time.Time { return cur }
+
+	tr.ApplyAgentStatusChanged(events.NormalizedEvent{PaneID: "w1:p1", WorkspaceID: "w1", Agent: "codex", NewState: snapshot.AgentStatusDone})
+	cur = cur.Add(time.Minute)
+	tr.ApplyPaneClosed(events.NormalizedEvent{PaneID: "w1:p1"})
+	nextStateDuration(t, tr) // the close flush (done)
+	<-tr.AttentionLatency()  // the close flush (attention latency)
+
+	// Late event for the pane, still inside the grace window: absorbed.
+	tr.ApplyAgentStatusChanged(events.NormalizedEvent{PaneID: "w1:p1", WorkspaceID: "w1", Agent: "codex", NewState: snapshot.AgentStatusWorking})
+	assertNoStateDuration(t, tr)
+}
+
+func TestStateDurationDoubleCascadeEmitsOnce(t *testing.T) {
+	cur := time.Date(2026, 9, 11, 12, 0, 0, 0, time.UTC)
+	tr := NewTracker()
+	tr.now = func() time.Time { return cur }
+
+	tr.ApplyWorkspaceCreated(events.NormalizedEvent{WorkspaceID: "w1"})
+	tr.ApplyTabCreated(events.NormalizedEvent{TabID: "w1:t1", WorkspaceID: "w1"})
+	tr.ApplyPaneCreated(events.NormalizedEvent{PaneID: "w1:p1", WorkspaceID: "w1", TabID: "w1:t1"})
+	tr.ApplyAgentStatusChanged(events.NormalizedEvent{PaneID: "w1:p1", WorkspaceID: "w1", Agent: "codex", NewState: snapshot.AgentStatusDone})
+	cur = cur.Add(4 * time.Minute)
+
+	tr.ApplyTabClosed(events.NormalizedEvent{TabID: "w1:t1", WorkspaceID: "w1"})
+	tr.ApplyWorkspaceClosed(events.NormalizedEvent{WorkspaceID: "w1"})
+
+	sd := nextStateDuration(t, tr)
+	if sd.State != snapshot.AgentStatusDone || sd.Duration != 4*time.Minute {
+		t.Errorf("cascaded state duration = %+v, want done for 4m", sd)
+	}
+	assertNoStateDuration(t, tr)
+	<-tr.AttentionLatency() // drain the separate done-close sample
 }
 
 func TestApplyPaneClosedFlushesDoneInterval(t *testing.T) {

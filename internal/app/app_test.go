@@ -108,6 +108,20 @@ func drainTransitions(t *testing.T, a *App) {
 	}
 }
 
+// drainStateDurations replicates Run's select-case consumer, forwarding each
+// closed state interval to the histogram exactly as production does.
+func drainStateDurations(t *testing.T, a *App) {
+	t.Helper()
+	for {
+		select {
+		case sd := <-a.tr.StateDurations():
+			a.recordStateDuration(sd)
+		default:
+			return
+		}
+	}
+}
+
 func findInt64SumPoints(t *testing.T, rm metricdata.ResourceMetrics, name string) []metricdata.DataPoint[int64] {
 	t.Helper()
 	var out []metricdata.DataPoint[int64]
@@ -121,6 +135,24 @@ func findInt64SumPoints(t *testing.T, rm metricdata.ResourceMetrics, name string
 				t.Fatalf("metric %s data type = %T, want Sum[int64]", name, m.Data)
 			}
 			out = append(out, sum.DataPoints...)
+		}
+	}
+	return out
+}
+
+func findFloat64HistogramPoints(t *testing.T, rm metricdata.ResourceMetrics, name string) []metricdata.HistogramDataPoint[float64] {
+	t.Helper()
+	var out []metricdata.HistogramDataPoint[float64]
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			if m.Name != name {
+				continue
+			}
+			h, ok := m.Data.(metricdata.Histogram[float64])
+			if !ok {
+				t.Fatalf("metric %s data type = %T, want Histogram[float64]", name, m.Data)
+			}
+			out = append(out, h.DataPoints...)
 		}
 	}
 	return out
@@ -226,6 +258,102 @@ func TestRecordTransitionNoopWithoutTelemetry(t *testing.T) {
 	default:
 		t.Fatal("expected a transition from the tracker")
 	}
+}
+
+func TestRecordStateDurationHistogramEventDriven(t *testing.T) {
+	reader := metric.NewManualReader()
+	mp := otel.NewMeterProviderWithReader(reader, resource.NewSchemaless(attribute.String("service.name", "test")))
+	defer func() { _ = mp.Shutdown(context.Background()) }()
+
+	a := &App{meter: mp.Meter(otel.MeterName), tr: tracker.NewTracker()}
+	a.registerStateDurationHistogram()
+	if a.stateDurationHistogram == nil {
+		t.Fatal("registerStateDurationHistogram did not create the histogram")
+	}
+
+	a.handleEvent(statusEv(snapshot.AgentStatusWorking)) // first-seen: nothing to close
+	a.handleEvent(statusEv(snapshot.AgentStatusBlocked)) // closes working
+	drainStateDurations(t, a)
+
+	var rm metricdata.ResourceMetrics
+	if err := reader.Collect(context.Background(), &rm); err != nil {
+		t.Fatalf("collect: %v", err)
+	}
+	points := findFloat64HistogramPoints(t, rm, otel.DurationMetricName)
+	if len(points) != 1 {
+		t.Fatalf("state-duration datapoints = %d, want 1 (first-seen records none)", len(points))
+	}
+	dp := points[0]
+	if dp.Count != 1 {
+		t.Errorf("count = %d, want 1", dp.Count)
+	}
+	if got := attrString(t, dp.Attributes, otel.AgentTypeKey); got != "codex" {
+		t.Errorf("agent.type = %q, want codex", got)
+	}
+	if got := attrString(t, dp.Attributes, otel.AgentStateKey); got != "working" {
+		t.Errorf("state = %q, want working", got)
+	}
+}
+
+func TestRecordStateDurationHistogramSeenFlip(t *testing.T) {
+	reader := metric.NewManualReader()
+	mp := otel.NewMeterProviderWithReader(reader, resource.NewSchemaless(attribute.String("service.name", "test")))
+	defer func() { _ = mp.Shutdown(context.Background()) }()
+
+	a := &App{meter: mp.Meter(otel.MeterName), tr: tracker.NewTracker()}
+	a.registerStateDurationHistogram()
+
+	// The silent reconcile-detected close path (2.4): done is flip-flopped to
+	// idle by ApplySeenFlip, closing the done interval.
+	a.handleEvent(statusEv(snapshot.AgentStatusDone))
+	a.tr.ApplySeenFlip("w1:p1")
+	drainStateDurations(t, a)
+
+	var rm metricdata.ResourceMetrics
+	if err := reader.Collect(context.Background(), &rm); err != nil {
+		t.Fatalf("collect: %v", err)
+	}
+	points := findFloat64HistogramPoints(t, rm, otel.DurationMetricName)
+	if len(points) != 1 {
+		t.Fatalf("state-duration datapoints = %d, want 1", len(points))
+	}
+	if got := attrString(t, points[0].Attributes, otel.AgentStateKey); got != "done" {
+		t.Errorf("state = %q, want done", got)
+	}
+}
+
+func TestRecordStateDurationHistogramCloseFlush(t *testing.T) {
+	reader := metric.NewManualReader()
+	mp := otel.NewMeterProviderWithReader(reader, resource.NewSchemaless(attribute.String("service.name", "test")))
+	defer func() { _ = mp.Shutdown(context.Background()) }()
+
+	a := &App{meter: mp.Meter(otel.MeterName), tr: tracker.NewTracker()}
+	a.registerStateDurationHistogram()
+
+	// Closing a pane mid-state flushes the open interval (2.7 flush-on-close).
+	a.handleEvent(statusEv(snapshot.AgentStatusWorking))
+	a.handleEvent(events.NormalizedEvent{Kind: events.KindPaneClosed, PaneID: "w1:p1"})
+	drainStateDurations(t, a)
+
+	var rm metricdata.ResourceMetrics
+	if err := reader.Collect(context.Background(), &rm); err != nil {
+		t.Fatalf("collect: %v", err)
+	}
+	points := findFloat64HistogramPoints(t, rm, otel.DurationMetricName)
+	if len(points) != 1 {
+		t.Fatalf("state-duration datapoints = %d, want 1", len(points))
+	}
+	if got := attrString(t, points[0].Attributes, otel.AgentStateKey); got != "working" {
+		t.Errorf("state = %q, want working", got)
+	}
+}
+
+func TestRecordStateDurationNoopWithoutTelemetry(t *testing.T) {
+	// Telemetry disabled (nil histogram): consuming closed intervals must be a
+	// no-op, never a panic or block.
+	a := &App{tr: tracker.NewTracker()}
+	sd := tracker.StateDuration{PaneID: "w1:p1", WorkspaceID: "w1", Agent: "codex", State: snapshot.AgentStatusWorking}
+	a.recordStateDuration(sd)
 }
 
 func TestHandleEventRoutesTabKinds(t *testing.T) {

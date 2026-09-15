@@ -296,10 +296,11 @@ Implemented and tested, as of the current `main` branch:
   cascade now flushes `done` agents' attention-latency intervals too,
   matching the pane/tab paths, and the `closeAgentLocked` idempotency guard
   keeps tab.closed-then-workspace.closed double cascades to a single flush
-  and decrement. `DurationByState` is freed at close — Phase 3.4 reads live
-  records, so only identity + `ClosedAt` metadata is retained. `Tracker.Agents()`
-  (added for live verification, mirroring `Tabs()`) snapshots per-agent state
-  for Phase 3.4 exporters.
+  and decrement. `DurationByState` is freed at close — each closed state
+  interval is surfaced at exit time via the `Tracker.StateDurations()` channel
+  (3.4), so the map is pure accounting and only identity + `ClosedAt` metadata
+  is retained. `Tracker.Agents()` (added for live verification, mirroring
+  `Tabs()`) snapshots per-agent state for live-verification spikes.
 - **Phase 2 exit criteria — both parts live-verified 2026-09 against a
   running Herdr v0.9.0.** (1) `pane.report_agent` drove a pane through
   working→blocked→working; the tracker closed working=1m24.271s and
@@ -338,6 +339,21 @@ Implemented and tested, as of the current `main` branch:
   seeding, or close-time flushes. Incremented with `herdr.agent.type`,
   `herdr.agent.previous_state`, `herdr.agent.state` attributes — bounded
   cardinality by construction (no pane/workspace id).
+- **3.4** — `herdr.agent.state.duration` histogram
+  (`internal/otel/meter.go`'s `DurationMetricName`, `NewDurationHistogram`,
+  unit `s`; `App` registers it via `registerStateDurationHistogram`/
+  `recordStateDuration`). The tracker surfaces each *closed* state interval at
+  the moment it closes through a new `StateDuration` channel
+  (`Tracker.StateDurations()`), recording one histogram sample tagged
+  `herdr.agent.type` + `herdr.agent.state` (working/blocked/idle/done/unknown,
+  bounded cardinality). Emission sites are the three duration-close paths:
+  the real transition (`ApplyAgentStatusChanged`), the silent done→idle close
+  (`ApplySeenFlip`), and the close-time flush (`closeAgentLocked`); never on
+  first-seen upserts, same-state re-applies, re-baseline seeding, or
+  late status-in-grace (absorbed). This is a *closed* duration metric by
+  design — polling the tracker's live records (as an earlier note here and in
+  `types.go` had anticipated) would have sampled open interval ages instead
+  of completed durations, and `DurationByState` is freed at close anyway.
 
 **Not yet implemented** — confirmed by `grep`, not just absence from this
 list:
@@ -347,8 +363,8 @@ list:
   `app.subscribeWithBackoff` only covers subscribe/snapshot retries
   *within* a running process — it does not protect against the process
   itself crashing (finding #1). This is the top open item.
-- **Phase 3 (OTel/OTLP export)** — 3.1, 3.2 (resource attributes), and **3.3**
-  landed (see above); **3.4–3.9 not implemented**:
+- **Phase 3 (OTel/OTLP export)** — 3.1, 3.2 (resource attributes), **3.3**,
+  and **3.4** landed (see above); **3.5–3.9 not implemented**:
   `AttentionLatency()` results are still only logged in `app.Run` (see the
   `// Phase 3.5 replaces this log` comment there); `Tracker.Counts()` is
   implemented but nothing reads it yet.

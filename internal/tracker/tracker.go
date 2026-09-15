@@ -43,6 +43,13 @@ type Tracker struct {
 	// block on the state machine.
 	transitions chan AgentTransition
 
+	// stateDuration surfaces closed state intervals at the moment they close
+	// (3.4's herdr.agent.state.duration histogram). Emitted once per closed
+	// interval, never for first-seen upserts, same-state re-applies, or
+	// re-baseline seeding. Non-blocking send with drop-and-warn, same idiom
+	// as transitions.
+	stateDuration chan StateDuration
+
 	// graceWindow is how long a closed pane/tab/agent is retained after its
 	// close is applied, so late-arriving events are absorbed instead of
 	// re-creating a phantom (2.7). Defaults to DefaultGraceWindow; EvictExpired
@@ -68,6 +75,7 @@ func NewTracker() *Tracker {
 		agents:               map[string]AgentState{},
 		attentionLatency:     make(chan AttentionLatency, 64),
 		transitions:          make(chan AgentTransition, 64),
+		stateDuration:        make(chan StateDuration, 64),
 		now:                  time.Now,
 		graceWindow:          DefaultGraceWindow,
 		stateCounts:          map[snapshot.AgentStatus]int{},
@@ -84,6 +92,11 @@ func (t *Tracker) AttentionLatency() <-chan AttentionLatency { return t.attentio
 // (2.3). Phase 3.3 consumes this channel to increment
 // herdr.agent.state.transitions.
 func (t *Tracker) Transitions() <-chan AgentTransition { return t.transitions }
+
+// StateDurations delivers closed state intervals at the moment they close
+// (2.3). Phase 3.4 consumes this channel to record
+// herdr.agent.state.duration histogram samples.
+func (t *Tracker) StateDurations() <-chan StateDuration { return t.stateDuration }
 
 // Tabs returns the tracked tab state as a shallow copy. Safe to call from any
 // goroutine; phase 3 exporters snapshot it rather than reading under the
@@ -124,6 +137,14 @@ func (t *Tracker) emitTransition(tr AgentTransition) {
 	case t.transitions <- tr:
 	default:
 		slog.Warn("transition channel full; dropping", "pane_id", tr.PaneID, "agent", tr.Agent, "previous", tr.Previous, "new", tr.New)
+	}
+}
+
+func (t *Tracker) emitStateDuration(sd StateDuration) {
+	select {
+	case t.stateDuration <- sd:
+	default:
+		slog.Warn("state duration channel full; dropping", "pane_id", sd.PaneID, "agent", sd.Agent, "state", sd.State)
 	}
 }
 
@@ -181,7 +202,16 @@ func (t *Tracker) closeAgentLocked(id string, now time.Time) {
 			ObservedAt:  now,
 		})
 	}
-	ag.DurationByState[ag.Status] += now.Sub(ag.StateEnteredAt)
+	closed := now.Sub(ag.StateEnteredAt)
+	ag.DurationByState[ag.Status] += closed
+	t.emitStateDuration(StateDuration{
+		PaneID:      ag.PaneID,
+		WorkspaceID: ag.WorkspaceID,
+		Agent:       ag.AgentType,
+		State:       ag.Status,
+		Duration:    closed,
+		ObservedAt:  now,
+	})
 	ag.DurationByState = nil
 	ag.ClosedAt = now
 	t.agents[id] = ag

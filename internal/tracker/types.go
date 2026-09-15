@@ -64,8 +64,9 @@ type AgentState struct {
 	// callers wanting an as-of-now total add time.Since(StateEnteredAt).
 	//
 	// On close (2.7) the open interval is flushed into this map and the map
-	// is then freed (set to nil): at close time the durations have no
-	// consumer yet (Phase 3.4 reads live records), so only identity + ClosedAt
+	// is then freed (set to nil). Each closed interval is surfaced at exit
+	// time via the StateDuration channel (3.4), so the map here is pure
+	// accounting rather than the export path; only identity + ClosedAt
 	// metadata is retained through the grace window.
 	DurationByState map[snapshot.AgentStatus]time.Duration
 
@@ -115,6 +116,28 @@ type AttentionLatency struct {
 	PaneID      string
 	WorkspaceID string
 	Agent       string
+	Duration    time.Duration
+	ObservedAt  time.Time
+}
+
+// StateDuration is emitted whenever a tracked agent's interval in a state is
+// closed (2.3): the elapsed time it spent in State, recorded exactly once at
+// the moment the agent leaves that state. Its three close sites are the real
+// transition (ApplyAgentStatusChanged), the silent done→idle close
+// (ApplySeenFlip), and the close-time flush (closeAgentLocked). It feeds the
+// 3.4 OTel histogram (herdr.agent.state.duration); this layer only computes
+// and surfaces it.
+//
+// Never emitted for first-seen upserts (no prior state), same-state re-applies,
+// or re-baseline seeding — nothing is closed there. The closed interval is the
+// same value accumulated into DurationByState, surfaced here at exit time,
+// which is what makes the 3.4 histogram a *closed* duration metric rather than
+// a re-sampled live age.
+type StateDuration struct {
+	PaneID      string
+	WorkspaceID string
+	Agent       string
+	State       snapshot.AgentStatus
 	Duration    time.Duration
 	ObservedAt  time.Time
 }

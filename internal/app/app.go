@@ -49,6 +49,11 @@ type App struct {
 	// only when telemetry initialized. Nil means recordTransition no-ops.
 	transitions metric.Int64Counter
 
+	// stateDurationHistogram is the herdr.agent.state.duration histogram (3.4),
+	// defined only when telemetry initialized. Nil means recordStateDuration
+	// no-ops.
+	stateDurationHistogram metric.Float64Histogram
+
 	// shutdownTelemetry flushes and closes the MeterProvider. Nil when the
 	// SDK never initialized.
 	shutdownTelemetry func(context.Context) error
@@ -138,6 +143,11 @@ func (a *App) Run(ctx context.Context) error {
 			// 3.3: every genuine agent state transition increments the
 			// herdr.agent.state.transitions counter.
 			a.recordTransition(tr)
+
+		case sd := <-a.tr.StateDurations():
+			// 3.4: every closed state interval records one
+			// herdr.agent.state.duration histogram sample.
+			a.recordStateDuration(sd)
 
 		case <-resubscribe:
 			// Silent-stream guard (0.4): the socket is healthy but the event
@@ -229,6 +239,7 @@ func (a *App) initTelemetry(ctx context.Context) {
 	slog.Info("OTel metrics enabled", "service", otel.ServiceName(res))
 	a.registerUpMetric()
 	a.registerTransitionCounter()
+	a.registerStateDurationHistogram()
 }
 
 // shutdownTelemetryIfInitialized flushes and closes the MeterProvider. Safe to
@@ -286,6 +297,38 @@ func (a *App) recordTransition(tr tracker.AgentTransition) {
 			attribute.String(otel.AgentTypeKey, tr.Agent),
 			attribute.String(otel.AgentPreviousState, string(tr.Previous)),
 			attribute.String(otel.AgentStateKey, string(tr.New)),
+		),
+	)
+}
+
+// registerStateDurationHistogram registers the 3.4 herdr.agent.state.duration
+// histogram. Registration failure (e.g. a stale meter) disables the histogram,
+// never the subscription.
+func (a *App) registerStateDurationHistogram() {
+	if a.meter == nil {
+		return
+	}
+	hist, err := otel.NewDurationHistogram(a.meter)
+	if err != nil {
+		slog.Warn("registering "+otel.DurationMetricName+" failed", "error", err)
+		return
+	}
+	a.stateDurationHistogram = hist
+}
+
+// recordStateDuration records one herdr.agent.state.duration histogram sample
+// for a closed state interval, tagged by agent.type and the state whose
+// interval just closed. A nil histogram (telemetry disabled or registration
+// failed) is a no-op. Durations are recorded in seconds per the instrument
+// unit (3.4).
+func (a *App) recordStateDuration(sd tracker.StateDuration) {
+	if a.stateDurationHistogram == nil {
+		return
+	}
+	a.stateDurationHistogram.Record(context.Background(), sd.Duration.Seconds(),
+		metric.WithAttributes(
+			attribute.String(otel.AgentTypeKey, sd.Agent),
+			attribute.String(otel.AgentStateKey, string(sd.State)),
 		),
 	)
 }

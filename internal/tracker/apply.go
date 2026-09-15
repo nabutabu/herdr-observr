@@ -223,7 +223,16 @@ func (t *Tracker) ApplyAgentStatusChanged(ev events.NormalizedEvent) {
 
 	prevStatus := ag.Status
 	t.decrStateLocked(ag.WorkspaceID, prevStatus)
-	ag.DurationByState[prevStatus] += now.Sub(ag.StateEnteredAt)
+	closed := now.Sub(ag.StateEnteredAt)
+	ag.DurationByState[prevStatus] += closed
+	t.emitStateDuration(StateDuration{
+		PaneID:      ag.PaneID,
+		WorkspaceID: ag.WorkspaceID,
+		Agent:       ag.AgentType,
+		State:       prevStatus,
+		Duration:    closed,
+		ObservedAt:  now,
+	})
 	ag.Status = ev.NewState
 	ag.StateEnteredAt = now
 	ag.WorkspaceID = ev.WorkspaceID
@@ -278,12 +287,21 @@ func (t *Tracker) ApplySeenFlip(paneID string) {
 	}
 
 	t.decrStateLocked(ag.WorkspaceID, snapshot.AgentStatusDone)
-	ag.DurationByState[ag.Status] += now.Sub(ag.StateEnteredAt)
+	closed := now.Sub(ag.StateEnteredAt)
+	ag.DurationByState[ag.Status] += closed
 	t.emitAttentionLatency(AttentionLatency{
 		PaneID:      ag.PaneID,
 		WorkspaceID: ag.WorkspaceID,
 		Agent:       ag.AgentType,
 		Duration:    now.Sub(ag.AttentionStartedAt),
+		ObservedAt:  now,
+	})
+	t.emitStateDuration(StateDuration{
+		PaneID:      ag.PaneID,
+		WorkspaceID: ag.WorkspaceID,
+		Agent:       ag.AgentType,
+		State:       ag.Status,
+		Duration:    closed,
 		ObservedAt:  now,
 	})
 	ag.Status = snapshot.AgentStatusIdle
