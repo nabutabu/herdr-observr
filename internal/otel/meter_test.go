@@ -4,10 +4,68 @@ import (
 	"context"
 	"testing"
 
+	"go.opentelemetry.io/otel/attribute"
 	otmetric "go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 )
+
+func TestTransitionCounterRegistersAndIncrements(t *testing.T) {
+	// (3.3) Pin the registered metric name and its attribute keys: the app
+	// test asserts end-to-end increments, this one asserts the contract of the
+	// counter itself — name, unit, and the three-attribute shape.
+	setCleanEnv(t)
+
+	res, err := BuildResource(context.Background())
+	if err != nil {
+		t.Fatalf("BuildResource: %v", err)
+	}
+
+	reader := metric.NewManualReader()
+	mp := newMeterProviderWithReader(reader, res)
+	defer func() { _ = mp.Shutdown(context.Background()) }()
+
+	counter, err := NewTransitionCounter(mp.Meter(MeterName))
+	if err != nil {
+		t.Fatalf("NewTransitionCounter: %v", err)
+	}
+
+	counter.Add(context.Background(), 1,
+		otmetric.WithAttributes(
+			attribute.String(AgentTypeKey, "codex"),
+			attribute.String(AgentPreviousState, "working"),
+			attribute.String(AgentStateKey, "blocked"),
+		),
+	)
+
+	var rm metricdata.ResourceMetrics
+	if err := reader.Collect(context.Background(), &rm); err != nil {
+		t.Fatalf("collect: %v", err)
+	}
+
+	found := false
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			if m.Name != TransitionMetricName {
+				continue
+			}
+			found = true
+			if m.Unit != "1" {
+				t.Errorf("unit = %q, want %q", m.Unit, "1")
+			}
+			sum, ok := m.Data.(metricdata.Sum[int64])
+			if !ok {
+				t.Fatalf("data type = %T, want Sum[int64]", m.Data)
+			}
+			if len(sum.DataPoints) != 1 || sum.DataPoints[0].Value != 1 {
+				t.Errorf("datapoints = %+v, want a single value 1", sum.DataPoints)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("metric %q not found in collected data", TransitionMetricName)
+	}
+}
 
 func TestNewMeterProviderWithUnreachableEndpoint(t *testing.T) {
 	// The gRPC connection is established lazily, so construction must succeed

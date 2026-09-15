@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"time"
 
+	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
 
 	"github.com/nabutabu/herdr-scribe/internal/client"
@@ -43,6 +44,10 @@ type App struct {
 	// only when the OTel SDK initialized successfully; nil means telemetry is
 	// disabled and every instrument method returns a no-op.
 	meter metric.Meter
+
+	// transitions is the herdr.agent.state.transitions counter (3.3), defined
+	// only when telemetry initialized. Nil means recordTransition no-ops.
+	transitions metric.Int64Counter
 
 	// shutdownTelemetry flushes and closes the MeterProvider. Nil when the
 	// SDK never initialized.
@@ -128,6 +133,11 @@ func (a *App) Run(ctx context.Context) error {
 		case al := <-a.tr.AttentionLatency():
 			// Phase 3.5 replaces this log with an OTel histogram emission.
 			slog.Info("attention latency", "pane_id", al.PaneID, "agent", al.Agent, "duration", al.Duration)
+
+		case tr := <-a.tr.Transitions():
+			// 3.3: every genuine agent state transition increments the
+			// herdr.agent.state.transitions counter.
+			a.recordTransition(tr)
 
 		case <-resubscribe:
 			// Silent-stream guard (0.4): the socket is healthy but the event
@@ -218,6 +228,7 @@ func (a *App) initTelemetry(ctx context.Context) {
 	a.shutdownTelemetry = shutdown
 	slog.Info("OTel metrics enabled", "service", otel.ServiceName(res))
 	a.registerUpMetric()
+	a.registerTransitionCounter()
 }
 
 // shutdownTelemetryIfInitialized flushes and closes the MeterProvider. Safe to
@@ -246,6 +257,37 @@ func (a *App) registerUpMetric() {
 	if err != nil {
 		slog.Warn("registering "+otel.UpMetricName+" failed", "error", err)
 	}
+}
+
+// registerTransitionCounter registers the 3.3 herdr.agent.state.transitions
+// counter. Registration failure (e.g. a stale meter) disables the counter,
+// never the subscription.
+func (a *App) registerTransitionCounter() {
+	if a.meter == nil {
+		return
+	}
+	counter, err := otel.NewTransitionCounter(a.meter)
+	if err != nil {
+		slog.Warn("registering "+otel.TransitionMetricName+" failed", "error", err)
+		return
+	}
+	a.transitions = counter
+}
+
+// recordTransition increments herdr.agent.state.transitions for one genuine
+// agent state transition, tagged by agent.type and previous/new state. A nil
+// counter (telemetry disabled or registration failed) is a no-op.
+func (a *App) recordTransition(tr tracker.AgentTransition) {
+	if a.transitions == nil {
+		return
+	}
+	a.transitions.Add(context.Background(), 1,
+		metric.WithAttributes(
+			attribute.String(otel.AgentTypeKey, tr.Agent),
+			attribute.String(otel.AgentPreviousState, string(tr.Previous)),
+			attribute.String(otel.AgentStateKey, string(tr.New)),
+		),
+	)
 }
 
 func (a *App) ping(ctx context.Context) error {

@@ -76,6 +76,24 @@ type AgentState struct {
 	ClosedAt time.Time
 }
 
+// AgentTransition is one observed change from one tracked agent state to
+// another — a genuine status change (2.3), whether event-driven
+// (ApplyAgentStatusChanged) or reconcile-detected (ApplySeenFlip's silent
+// done→idle). It feeds the 3.3 OTel counter (herdr.agent.state.transitions);
+// this layer only computes and surfaces it.
+//
+// Never emitted for same-state re-applies, first-seen upserts (no previous
+// state to report), re-baseline seeding, or close-time flushes — those are
+// not transitions.
+type AgentTransition struct {
+	PaneID      string
+	WorkspaceID string
+	Agent       string
+	Previous    snapshot.AgentStatus
+	New         snapshot.AgentStatus
+	ObservedAt  time.Time
+}
+
 // AttentionLatency is emitted when an agent leaves `done` — the elapsed time
 // between entering done and being "seen". Phase 3 (3.5) wires this to an OTel
 // histogram; this layer only computes and surfaces it.
@@ -120,6 +138,13 @@ type Tracker struct {
 	// idiom.
 	attentionLatency chan AttentionLatency
 
+	// transitions surfaces genuine agent state transitions (3.3's
+	// herdr.agent.state.transitions counter). Non-blocking send with
+	// drop-and-warn on backpressure, same idiom as attentionLatency: under
+	// sustained backpressure an increment is the least-bad loss, never a
+	// block on the state machine.
+	transitions chan AgentTransition
+
 	// graceWindow is how long a closed pane/tab/agent is retained after its
 	// close is applied, so late-arriving events are absorbed instead of
 	// re-creating a phantom (2.7). Defaults to DefaultGraceWindow; EvictExpired
@@ -144,6 +169,7 @@ func NewTracker() *Tracker {
 		panes:                map[string]PaneState{},
 		agents:               map[string]AgentState{},
 		attentionLatency:     make(chan AttentionLatency, 64),
+		transitions:          make(chan AgentTransition, 64),
 		now:                  time.Now,
 		graceWindow:          DefaultGraceWindow,
 		stateCounts:          map[snapshot.AgentStatus]int{},
@@ -155,6 +181,11 @@ func NewTracker() *Tracker {
 // observed (2.4). Phase 3.5 consumes this channel; the app currently just
 // logs from it.
 func (t *Tracker) AttentionLatency() <-chan AttentionLatency { return t.attentionLatency }
+
+// Transitions delivers genuine agent state transitions as they are observed
+// (2.3). Phase 3.3 consumes this channel to increment
+// herdr.agent.state.transitions.
+func (t *Tracker) Transitions() <-chan AgentTransition { return t.transitions }
 
 // Tabs returns the tracked tab state as a shallow copy. Safe to call from any
 // goroutine; phase 3 exporters snapshot it rather than reading under the
@@ -187,6 +218,14 @@ func (t *Tracker) emitAttentionLatency(al AttentionLatency) {
 	case t.attentionLatency <- al:
 	default:
 		slog.Warn("attention latency channel full; dropping", "pane_id", al.PaneID, "agent", al.Agent)
+	}
+}
+
+func (t *Tracker) emitTransition(tr AgentTransition) {
+	select {
+	case t.transitions <- tr:
+	default:
+		slog.Warn("transition channel full; dropping", "pane_id", tr.PaneID, "agent", tr.Agent, "previous", tr.Previous, "new", tr.New)
 	}
 }
 
@@ -513,6 +552,14 @@ func (t *Tracker) ApplyAgentStatusChanged(ev events.NormalizedEvent) {
 		ag.AttentionStartedAt = time.Time{}
 	}
 	t.agents[ev.PaneID] = ag
+	t.emitTransition(AgentTransition{
+		PaneID:      ag.PaneID,
+		WorkspaceID: ag.WorkspaceID,
+		Agent:       ag.AgentType,
+		Previous:    prevStatus,
+		New:         ev.NewState,
+		ObservedAt:  now,
+	})
 }
 
 // ApplySeenFlip closes out a reconcile-detected done→idle transition: the
@@ -549,6 +596,14 @@ func (t *Tracker) ApplySeenFlip(paneID string) {
 	ag.AttentionStartedAt = time.Time{}
 	t.incrStateLocked(ag.WorkspaceID, snapshot.AgentStatusIdle)
 	t.agents[paneID] = ag
+	t.emitTransition(AgentTransition{
+		PaneID:      ag.PaneID,
+		WorkspaceID: ag.WorkspaceID,
+		Agent:       ag.AgentType,
+		Previous:    snapshot.AgentStatusDone,
+		New:         snapshot.AgentStatusIdle,
+		ObservedAt:  now,
+	})
 
 	if pane, ok := t.panes[paneID]; ok {
 		pane.Status = snapshot.AgentStatusIdle

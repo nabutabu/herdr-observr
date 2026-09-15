@@ -27,6 +27,23 @@ const (
 	UpMetricName = "herdr.up"
 )
 
+// (3.3) herdr.agent.state.transitions — a counter incremented once per genuine
+// agent state transition (2.3), tagged by agent type and previous/new state.
+// Bounded cardinality by construction: agent.type is a small closed set and
+// each state has five values; no pane/workspace id participates (those are
+// high cardinality and gated behind config in 3.6).
+const (
+	// TransitionMetricName is the 3.3 counter metric name.
+	TransitionMetricName = "herdr.agent.state.transitions"
+
+	// Attribute keys on TransitionMetricName. The herdr.* prefix matches 3.8's
+	// herdr.agent.* scheme and the existing herdr.machine.* resource keys;
+	// "state" (not "new_state") is the forward-compatible name 3.8 shares.
+	AgentTypeKey       = "herdr.agent.type"
+	AgentPreviousState = "herdr.agent.previous_state"
+	AgentStateKey      = "herdr.agent.state"
+)
+
 // NewMeterProvider initializes the OTel metrics SDK with the OTLP/gRPC
 // exporter and associates it with res.
 //
@@ -66,4 +83,25 @@ func NewMeterProvider(ctx context.Context, res *resource.Resource) (apimetric.Me
 // reader instead of a live collector.
 func newMeterProviderWithReader(reader metric.Reader, res *resource.Resource) *metric.MeterProvider {
 	return metric.NewMeterProvider(metric.WithReader(reader), metric.WithResource(res))
+}
+
+// NewMeterProviderWithReader builds a MeterProvider over an explicit Reader,
+// exported for cross-package tests that inspect collected metric data without
+// a live collector (the app tests drive a manual reader the same way the
+// package-internal meter tests do). Returns the concrete provider so callers
+// can Shutdown/flush it. Not part of the runtime configuration; production
+// code should use NewMeterProvider.
+func NewMeterProviderWithReader(reader metric.Reader, res *resource.Resource) *metric.MeterProvider {
+	return newMeterProviderWithReader(reader, res)
+}
+
+// NewTransitionCounter registers herdr.agent.state.transitions (3.3) on meter
+// and returns it, or an error if registration failed. The returned counter is
+// a no-op when the meter itself is a no-op (telemetry disabled).
+func NewTransitionCounter(meter apimetric.Meter) (apimetric.Int64Counter, error) {
+	return meter.Int64Counter(
+		TransitionMetricName,
+		apimetric.WithUnit("1"),
+		apimetric.WithDescription("Count of genuine agent state transitions, tagged by agent type and previous/new state"),
+	)
 }

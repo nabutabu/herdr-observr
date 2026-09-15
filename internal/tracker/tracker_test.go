@@ -317,6 +317,129 @@ func TestApplySeenFlipIsNoopWhenAgentLeftDone(t *testing.T) {
 	}
 }
 
+func nextTransition(t *testing.T, tr *Tracker) AgentTransition {
+	t.Helper()
+	select {
+	case trns := <-tr.Transitions():
+		return trns
+	default:
+		t.Fatal("no transition emitted")
+		return AgentTransition{}
+	}
+}
+
+func assertNoTransition(t *testing.T, tr *Tracker) {
+	t.Helper()
+	select {
+	case trns := <-tr.Transitions():
+		t.Errorf("unexpected transition emitted: %+v", trns)
+	default:
+	}
+}
+
+func TestTransitionsOnStatusChange(t *testing.T) {
+	cur := time.Date(2026, 9, 11, 12, 0, 0, 0, time.UTC)
+	tr := NewTracker()
+	tr.now = func() time.Time { return cur }
+	change := func(s snapshot.AgentStatus) {
+		tr.ApplyAgentStatusChanged(events.NormalizedEvent{PaneID: "w1:p1", WorkspaceID: "w1", Agent: "codex", NewState: s})
+	}
+
+	// First-seen upsert creates the agent but has no previous state to report
+	// (3.3 semantics: a transition is a change between two known states).
+	change(snapshot.AgentStatusWorking)
+	assertNoTransition(t, tr)
+
+	cur = cur.Add(2 * time.Minute)
+	change(snapshot.AgentStatusBlocked)
+
+	trns := nextTransition(t, tr)
+	if trns.Previous != snapshot.AgentStatusWorking || trns.New != snapshot.AgentStatusBlocked {
+		t.Errorf("transition = %+v, want working→blocked", trns)
+	}
+	if trns.Agent != "codex" || trns.PaneID != "w1:p1" || trns.WorkspaceID != "w1" {
+		t.Errorf("transition identity = %+v", trns)
+	}
+	if trns.ObservedAt != cur {
+		t.Errorf("transition ObservedAt = %v, want %v", trns.ObservedAt, cur)
+	}
+
+	cur = cur.Add(3 * time.Minute)
+	change(snapshot.AgentStatusWorking)
+
+	trns = nextTransition(t, tr)
+	if trns.Previous != snapshot.AgentStatusBlocked || trns.New != snapshot.AgentStatusWorking {
+		t.Errorf("transition = %+v, want blocked→working", trns)
+	}
+	assertNoTransition(t, tr)
+}
+
+func TestTransitionsNotEmittedOnSameState(t *testing.T) {
+	tr := NewTracker()
+	change := func(s snapshot.AgentStatus) {
+		tr.ApplyAgentStatusChanged(events.NormalizedEvent{PaneID: "w1:p1", WorkspaceID: "w1", Agent: "codex", NewState: s})
+	}
+
+	change(snapshot.AgentStatusWorking) // first-seen
+	change(snapshot.AgentStatusWorking) // duplicate: idempotency no-op
+	assertNoTransition(t, tr)
+
+	change(snapshot.AgentStatusBlocked)
+	if trns := nextTransition(t, tr); trns.Previous != snapshot.AgentStatusWorking || trns.New != snapshot.AgentStatusBlocked {
+		t.Errorf("transition = %+v, want a single working→blocked", trns)
+	}
+	assertNoTransition(t, tr)
+}
+
+func TestTransitionsNotEmittedOnSnapshotBaseline(t *testing.T) {
+	tr := NewTracker()
+	agent := "codex"
+	tr.ApplySnapshot(snapshot.Snapshot{
+		Panes: []snapshot.Pane{{PaneID: "w1:p1", WorkspaceID: "w1", TabID: "w1:t1", AgentStatus: snapshot.AgentStatusWorking, Agent: &agent}},
+	})
+	// Re-baseline seeding establishes current state; it is not a transition.
+	assertNoTransition(t, tr)
+}
+
+func TestTransitionsNotEmittedOnClose(t *testing.T) {
+	cur := time.Date(2026, 9, 11, 12, 0, 0, 0, time.UTC)
+	tr := NewTracker()
+	tr.now = func() time.Time { return cur }
+
+	tr.ApplyAgentStatusChanged(events.NormalizedEvent{PaneID: "w1:p1", WorkspaceID: "w1", Agent: "codex", NewState: snapshot.AgentStatusDone})
+	cur = cur.Add(3 * time.Minute)
+	tr.ApplyPaneClosed(events.NormalizedEvent{PaneID: "w1:p1"})
+
+	<-tr.AttentionLatency() // the close flushes attention latency, not a transition
+	assertNoTransition(t, tr)
+}
+
+func TestTransitionsEmittedOnSeenFlip(t *testing.T) {
+	cur := time.Date(2026, 9, 11, 12, 0, 0, 0, time.UTC)
+	tr := NewTracker()
+	tr.now = func() time.Time { return cur }
+
+	tr.ApplyAgentStatusChanged(events.NormalizedEvent{PaneID: "w1:p1", WorkspaceID: "w1", Agent: "codex", NewState: snapshot.AgentStatusDone})
+	assertNoTransition(t, tr) // entering done from unknown is a first-seen, not a change
+
+	cur = cur.Add(4 * time.Minute)
+	tr.ApplySeenFlip("w1:p1")
+
+	trns := nextTransition(t, tr)
+	if trns.Previous != snapshot.AgentStatusDone || trns.New != snapshot.AgentStatusIdle {
+		t.Errorf("seen-flip transition = %+v, want done→idle", trns)
+	}
+	if trns.Agent != "codex" {
+		t.Errorf("seen-flip transition agent = %q, want codex", trns.Agent)
+	}
+	<-tr.AttentionLatency() // drain the close of the done interval
+
+	// A second flip for an agent no longer done is a no-op: no transition.
+	cur = cur.Add(time.Minute)
+	tr.ApplySeenFlip("w1:p1")
+	assertNoTransition(t, tr)
+}
+
 func TestApplyPaneClosedFlushesDoneInterval(t *testing.T) {
 	cur := time.Date(2026, 9, 11, 12, 0, 0, 0, time.UTC)
 	tr := NewTracker()

@@ -5,7 +5,13 @@ import (
 	"testing"
 
 	"github.com/nabutabu/herdr-scribe/internal/events"
+	"github.com/nabutabu/herdr-scribe/internal/otel"
+	"github.com/nabutabu/herdr-scribe/internal/snapshot"
 	"github.com/nabutabu/herdr-scribe/internal/tracker"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/sdk/metric"
+	"go.opentelemetry.io/otel/sdk/metric/metricdata"
+	"go.opentelemetry.io/otel/sdk/resource"
 )
 
 func TestPaneCreatedNeedsResubscribe(t *testing.T) {
@@ -86,6 +92,140 @@ func TestInitTelemetryRegistersUpGauge(t *testing.T) {
 		t.Fatal("initTelemetry did not install the shutdown func")
 	}
 	a.shutdownTelemetryIfInitialized(context.Background())
+}
+
+// drainTransitions replicates Run's select-case consumer, forwarding each
+// transition to the counter exactly as production does.
+func drainTransitions(t *testing.T, a *App) {
+	t.Helper()
+	for {
+		select {
+		case tr := <-a.tr.Transitions():
+			a.recordTransition(tr)
+		default:
+			return
+		}
+	}
+}
+
+func findInt64SumPoints(t *testing.T, rm metricdata.ResourceMetrics, name string) []metricdata.DataPoint[int64] {
+	t.Helper()
+	var out []metricdata.DataPoint[int64]
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			if m.Name != name {
+				continue
+			}
+			sum, ok := m.Data.(metricdata.Sum[int64])
+			if !ok {
+				t.Fatalf("metric %s data type = %T, want Sum[int64]", name, m.Data)
+			}
+			out = append(out, sum.DataPoints...)
+		}
+	}
+	return out
+}
+
+func attrString(t *testing.T, s attribute.Set, key string) string {
+	t.Helper()
+	v, ok := s.Value(attribute.Key(key))
+	if !ok {
+		t.Fatalf("missing attribute %q in %s", key, s.Encoded(attribute.DefaultEncoder()))
+	}
+	return v.AsString()
+}
+
+// statusEv is a minimal pane.agent_status_changed event the tracker applies
+// through its normal handleEvent path.
+func statusEv(s snapshot.AgentStatus) events.NormalizedEvent {
+	return events.NormalizedEvent{Kind: events.KindAgentStatusChanged, PaneID: "w1:p1", WorkspaceID: "w1", Agent: "codex", NewState: s}
+}
+
+func TestRecordTransitionCounterEventDriven(t *testing.T) {
+	reader := metric.NewManualReader()
+	mp := otel.NewMeterProviderWithReader(reader, resource.NewSchemaless(attribute.String("service.name", "test")))
+	defer func() { _ = mp.Shutdown(context.Background()) }()
+
+	a := &App{meter: mp.Meter(otel.MeterName), tr: tracker.NewTracker()}
+	a.registerTransitionCounter()
+	if a.transitions == nil {
+		t.Fatal("registerTransitionCounter did not create the counter")
+	}
+
+	a.handleEvent(statusEv(snapshot.AgentStatusWorking)) // first-seen: no transition
+	a.handleEvent(statusEv(snapshot.AgentStatusBlocked)) // working→blocked
+	drainTransitions(t, a)
+
+	var rm metricdata.ResourceMetrics
+	if err := reader.Collect(context.Background(), &rm); err != nil {
+		t.Fatalf("collect: %v", err)
+	}
+	points := findInt64SumPoints(t, rm, otel.TransitionMetricName)
+	if len(points) != 1 {
+		t.Fatalf("transition datapoints = %d, want 1 (first-seen emits none)", len(points))
+	}
+	dp := points[0]
+	if dp.Value != 1 {
+		t.Errorf("transition count = %d, want 1", dp.Value)
+	}
+	if got := attrString(t, dp.Attributes, otel.AgentTypeKey); got != "codex" {
+		t.Errorf("agent.type = %q, want codex", got)
+	}
+	if got := attrString(t, dp.Attributes, otel.AgentPreviousState); got != "working" {
+		t.Errorf("previous_state = %q, want working", got)
+	}
+	if got := attrString(t, dp.Attributes, otel.AgentStateKey); got != "blocked" {
+		t.Errorf("state = %q, want blocked", got)
+	}
+}
+
+func TestRecordTransitionCounterSeenFlip(t *testing.T) {
+	reader := metric.NewManualReader()
+	mp := otel.NewMeterProviderWithReader(reader, resource.NewSchemaless(attribute.String("service.name", "test")))
+	defer func() { _ = mp.Shutdown(context.Background()) }()
+
+	a := &App{meter: mp.Meter(otel.MeterName), tr: tracker.NewTracker()}
+	a.registerTransitionCounter()
+
+	// The silent reconcile-detected close path (2.4): done is flip-flopped to
+	// idle by ApplySeenFlip, exactly as onReport does in production.
+	a.handleEvent(statusEv(snapshot.AgentStatusDone))
+	a.tr.ApplySeenFlip("w1:p1")
+	drainTransitions(t, a)
+
+	var rm metricdata.ResourceMetrics
+	if err := reader.Collect(context.Background(), &rm); err != nil {
+		t.Fatalf("collect: %v", err)
+	}
+	points := findInt64SumPoints(t, rm, otel.TransitionMetricName)
+	if len(points) != 1 {
+		t.Fatalf("transition datapoints = %d, want 1", len(points))
+	}
+	dp := points[0]
+	if dp.Value != 1 {
+		t.Errorf("transition count = %d, want 1", dp.Value)
+	}
+	if got := attrString(t, dp.Attributes, otel.AgentPreviousState); got != "done" {
+		t.Errorf("previous_state = %q, want done", got)
+	}
+	if got := attrString(t, dp.Attributes, otel.AgentStateKey); got != "idle" {
+		t.Errorf("state = %q, want idle", got)
+	}
+}
+
+func TestRecordTransitionNoopWithoutTelemetry(t *testing.T) {
+	// Telemetry disabled (nil counter): consuming transitions must be a no-op,
+	// never a panic or block.
+	a := &App{tr: tracker.NewTracker()}
+	tr := tracker.NewTracker()
+	tr.ApplyAgentStatusChanged(statusEv(snapshot.AgentStatusWorking))
+	tr.ApplyAgentStatusChanged(statusEv(snapshot.AgentStatusBlocked))
+	select {
+	case trns := <-tr.Transitions():
+		a.recordTransition(trns)
+	default:
+		t.Fatal("expected a transition from the tracker")
+	}
 }
 
 func TestHandleEventRoutesTabKinds(t *testing.T) {
