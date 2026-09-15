@@ -8,34 +8,35 @@ import (
 	"github.com/nabutabu/herdr-scribe/internal/client"
 )
 
+// Response is the top-level session.snapshot envelope. The wire frame also
+// carries a "type" field; json.Unmarshal ignores it here.
 type Response struct {
-	Type     string   `json:"type"`
 	Snapshot Snapshot `json:"snapshot"`
 }
 
+// Snapshot holds only the parts of a session.snapshot the plugin consumes:
+// workspace/tab/pane identity collections. The live wire shape carries much
+// more — version, protocol, focused_* ids, an agents[] collection, per-pane
+// terminal titles/cwd/scroll geometry, token maps, and per-entity counts —
+// which are intentionally not modeled: json.Unmarshal ignores unknown fields,
+// so a full live packet still parses, and keeping pane/terminal content and
+// UI-only metadata out of the structs (and out of the tests) keeps the
+// privacy constraint — no pane/terminal content on the wire — visible in the
+// contract itself rather than trusting every caller to filter.
 type Snapshot struct {
-	Version            string      `json:"version"`
-	Protocol           uint32      `json:"protocol"`
-	FocusedWorkspaceID *string     `json:"focused_workspace_id"`
-	FocusedTabID       *string     `json:"focused_tab_id"`
-	FocusedPaneID      *string     `json:"focused_pane_id"`
-	Workspaces         []Workspace `json:"workspaces"`
-	Tabs               []Tab       `json:"tabs"`
-	Panes              []Pane      `json:"panes"`
-	Agents             []Agent     `json:"agents"`
+	Workspaces []Workspace `json:"workspaces"`
+	Tabs       []Tab       `json:"tabs"`
+	Panes      []Pane      `json:"panes"`
 }
 
-// Tab mirrors the tabs[] collection of session.snapshot. Tabs carry no
-// lifecycle events in the subscription (0.2), so this collection is only ever
-// learned via snapshot fetches.
+// Tab mirrors the fields of the wire tabs[] collection that the tracker
+// consumes: identity and label drive tab tracking and membership drift
+// (finding #8). The rest of the wire tab shape (number, focused,
+// pane_count, agent_status) is metadata the tracker never reads.
 type Tab struct {
-	TabID       string      `json:"tab_id"`
-	WorkspaceID string      `json:"workspace_id"`
-	Label       string      `json:"label"`
-	Number      uint        `json:"number"`
-	Focused     bool        `json:"focused"`
-	PaneCount   uint        `json:"pane_count"`
-	AgentStatus AgentStatus `json:"agent_status"`
+	TabID       string `json:"tab_id"`
+	WorkspaceID string `json:"workspace_id"`
+	Label       string `json:"label"`
 }
 
 func Fetch(ctx context.Context) (Response, error) {
@@ -62,83 +63,23 @@ const (
 	AgentStatusUnknown AgentStatus = "unknown"
 )
 
+// Workspace holds only workspace identity for the tracker's workspace map and
+// drift diffs. The wire shape's counts, focus, active_tab_id, agent_status,
+// and tokens are not consumed.
 type Workspace struct {
-	WorkspaceID string            `json:"workspace_id"`
-	Number      uint              `json:"number"`
-	Label       string            `json:"label"`
-	Focused     bool              `json:"focused"`
-	PaneCount   uint              `json:"pane_count"`
-	TabCount    uint              `json:"tab_count"`
-	ActiveTabID string            `json:"active_tab_id"`
-	AgentStatus AgentStatus       `json:"agent_status"`
-	Tokens      map[string]string `json:"tokens,omitempty"`
+	WorkspaceID string `json:"workspace_id"`
+	Label       string `json:"label"`
 }
 
+// Pane holds only the fields the tracker mirrors: pane/workspace/tab identity,
+// the agent status, and the held agent's type (seed for AgentState.AgentType).
+// Everything else on the wire pane shape — terminal_id, focused, revision,
+// cwd, labels/titles, scroll geometry, session refs, state_labels, tokens —
+// is intentionally not captured (privacy: no pane/terminal content).
 type Pane struct {
-	PaneID                string            `json:"pane_id"`
-	TerminalID            string            `json:"terminal_id"`
-	WorkspaceID           string            `json:"workspace_id"`
-	TabID                 string            `json:"tab_id"`
-	Focused               bool              `json:"focused"`
-	AgentStatus           AgentStatus       `json:"agent_status"`
-	Revision              uint64            `json:"revision"`
-	Cwd                   *string           `json:"cwd"`
-	ForegroundCwd         *string           `json:"foreground_cwd"`
-	Label                 *string           `json:"label"`
-	Title                 *string           `json:"title"`
-	TerminalTitle         *string           `json:"terminal_title"`
-	TerminalTitleStripped *string           `json:"terminal_title_stripped"`
-	Agent                 *string           `json:"agent"`
-	DisplayAgent          *string           `json:"display_agent"`
-	Scroll                *PaneScrollInfo   `json:"scroll"`
-	AgentSession          *AgentSessionInfo `json:"agent_session"`
-	StateLabels           map[string]string `json:"state_labels"`
-	Tokens                map[string]string `json:"tokens"`
-}
-
-type Agent struct {
-	PaneID                 string            `json:"pane_id"`
-	TerminalID             string            `json:"terminal_id"`
-	WorkspaceID            string            `json:"workspace_id"`
-	TabID                  string            `json:"tab_id"`
-	Focused                bool              `json:"focused"`
-	AgentStatus            AgentStatus       `json:"agent_status"`
-	Revision               uint64            `json:"revision"`
-	Name                   *string           `json:"name"`
-	Cwd                    *string           `json:"cwd"`
-	ForegroundCwd          *string           `json:"foreground_cwd"`
-	Label                  *string           `json:"label"`
-	Title                  *string           `json:"title"`
-	TerminalTitle          *string           `json:"terminal_title"`
-	TerminalTitleStripped  *string           `json:"terminal_title_stripped"`
-	Agent                  *string           `json:"agent"`
-	DisplayAgent           *string           `json:"display_agent"`
-	InteractiveReady       bool              `json:"interactive_ready"`
-	LaunchPending          bool              `json:"launch_pending"`
-	ScreenDetectionSkipped bool              `json:"screen_detection_skipped"`
-	StateChangeSeq         uint64            `json:"state_change_seq"`
-	Scroll                 *PaneScrollInfo   `json:"scroll"`
-	AgentSession           *AgentSessionInfo `json:"agent_session"`
-	StateLabels            map[string]string `json:"state_labels"`
-	Tokens                 map[string]string `json:"tokens"`
-}
-
-type AgentSessionInfo struct {
-	Source string              `json:"source"`
-	Agent  string              `json:"agent"`
-	Kind   AgentSessionRefKind `json:"kind"`
-	Value  string              `json:"value"`
-}
-
-type AgentSessionRefKind string
-
-const (
-	AgentSessionRefKindID   AgentSessionRefKind = "id"
-	AgentSessionRefKindPath AgentSessionRefKind = "path"
-)
-
-type PaneScrollInfo struct {
-	OffsetFromBottom    uint64 `json:"offset_from_bottom"`
-	MaxOffsetFromBottom uint64 `json:"max_offset_from_bottom"`
-	ViewportRows        uint64 `json:"viewport_rows"`
+	PaneID      string      `json:"pane_id"`
+	WorkspaceID string      `json:"workspace_id"`
+	TabID       string      `json:"tab_id"`
+	AgentStatus AgentStatus `json:"agent_status"`
+	Agent       *string     `json:"agent"`
 }

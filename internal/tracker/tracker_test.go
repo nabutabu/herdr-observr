@@ -1127,19 +1127,19 @@ func TestDiffDetectsTabMembership(t *testing.T) {
 func TestDiffIgnoresTabMetadataChanges(t *testing.T) {
 	snap := snapshot.Snapshot{
 		Workspaces: []snapshot.Workspace{{WorkspaceID: "w1"}},
-		Tabs:       []snapshot.Tab{{TabID: "w1:t1", WorkspaceID: "w1", Label: "renamed", Number: 9, Focused: true}},
+		Tabs:       []snapshot.Tab{{TabID: "w1:t1", WorkspaceID: "w1", Label: "renamed"}},
 		Panes:      workingPanes(""),
 	}
 
 	tr := NewTracker()
 	tr.ApplySnapshot(snapshot.Snapshot{
 		Workspaces: []snapshot.Workspace{{WorkspaceID: "w1"}},
-		Tabs:       []snapshot.Tab{{TabID: "w1:t1", WorkspaceID: "w1", Label: "old", Number: 1, Focused: false}},
+		Tabs:       []snapshot.Tab{{TabID: "w1:t1", WorkspaceID: "w1", Label: "old"}},
 		Panes:      workingPanes(""),
 	})
 
 	if report := tr.Diff(snap); report.Drifted() {
-		t.Fatalf("tab metadata changes (label/number/focused) must not drift: %+v", report.Drifts)
+		t.Fatalf("tab label changes must not drift: %+v", report.Drifts)
 	}
 }
 
