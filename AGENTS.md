@@ -321,6 +321,23 @@ Implemented and tested, as of the current `main` branch:
   (this is what Phase 5.4 relies on). None of this requires a live Herdr to
   test (`go test ./internal/otel/...` uses a manual reader + an unreachable
   endpoint with a short `OTEL_EXPORTER_OTLP_TIMEOUT`).
+- **3.2 (resource attributes)** — `BuildResource` (in `internal/otel/resource.go`)
+  attaches `herdr.machine.id` (persisted UUID from `HERDR_PLUGIN_STATE_DIR`,
+  finding #7 / 0.6) and `herdr.machine.hostname` (secondary display-only, from
+  the plugin's own OS call) onto every exported resource datum. The
+  per-resource `herdr.workspace.id`/`herdr.pane.id`/`herdr.agent.id`/
+  `herdr.agent.type` attributes listed in the plan's 3.2 belong on metric
+  events/datapoints (3.8), not the resource, and are not wired yet.
+- **3.3** — `herdr.agent.state.transitions` counter
+  (`internal/otel/meter.go`'s `TransitionMetricName`, `App` registers it via
+  `registerTransitionCounter`/`recordTransition`). The tracker surfaces genuine
+  transitions through a new `AgentTransition` channel (`Tracker.Transitions()`,
+  mirroring `AttentionLatency`): emitted by `ApplyAgentStatusChanged` on every
+  real event-driven change and by `ApplySeenFlip` on the silent done→idle
+  close; never on same-state re-applies, first-seen upserts, re-baseline
+  seeding, or close-time flushes. Incremented with `herdr.agent.type`,
+  `herdr.agent.previous_state`, `herdr.agent.state` attributes — bounded
+  cardinality by construction (no pane/workspace id).
 
 **Not yet implemented** — confirmed by `grep`, not just absence from this
 list:
@@ -330,8 +347,8 @@ list:
   `app.subscribeWithBackoff` only covers subscribe/snapshot retries
   *within* a running process — it does not protect against the process
   itself crashing (finding #1). This is the top open item.
-- **Phase 3 (OTel/OTLP export)** — 3.1 landed (see above); **3.2–3.9 not
-  implemented**: no `herdr.machine.id` attribute yet, and
+- **Phase 3 (OTel/OTLP export)** — 3.1, 3.2 (resource attributes), and **3.3**
+  landed (see above); **3.4–3.9 not implemented**:
   `AttentionLatency()` results are still only logged in `app.Run` (see the
   `// Phase 3.5 replaces this log` comment there); `Tracker.Counts()` is
   implemented but nothing reads it yet.
