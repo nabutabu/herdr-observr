@@ -34,6 +34,7 @@ func TestNewMeterProviderWithUnreachableEndpoint(t *testing.T) {
 }
 
 func TestMeterProviderAssociatesResource(t *testing.T) {
+	setCleanEnv(t)
 	t.Setenv("OTEL_SERVICE_NAME", "svc")
 	t.Setenv("OTEL_RESOURCE_ATTRIBUTES", "env.k=v")
 
@@ -70,5 +71,49 @@ func TestMeterProviderAssociatesResource(t *testing.T) {
 	}
 	if got, ok := ResourceAttribute(rm.Resource, "env.k"); !ok || got != "v" {
 		t.Errorf("env.k = %q (ok=%v), want %q", got, ok, "v")
+	}
+}
+
+func TestMachineAttrsRideOnCollectedResource(t *testing.T) {
+	// The machine attributes must reach the exported OTLP resource, not just
+	// the in-memory one — prove it structurally with a manual reader (the same
+	// path the OTLP exporter takes, which 3.1 live-verified end to end).
+	setCleanEnv(t)
+	t.Setenv("HERDR_PLUGIN_STATE_DIR", t.TempDir())
+
+	res, err := BuildResource(context.Background())
+	if err != nil {
+		t.Fatalf("BuildResource: %v", err)
+	}
+
+	reader := metric.NewManualReader()
+	mp := newMeterProviderWithReader(reader, res)
+	defer func() { _ = mp.Shutdown(context.Background()) }()
+
+	meter := mp.Meter("test")
+	_, err = meter.Int64ObservableGauge(
+		"test.gauge",
+		otmetric.WithInt64Callback(func(_ context.Context, o otmetric.Int64Observer) error {
+			o.Observe(1)
+			return nil
+		}),
+	)
+	if err != nil {
+		t.Fatalf("creating observable gauge: %v", err)
+	}
+
+	var rm metricdata.ResourceMetrics
+	if err := reader.Collect(context.Background(), &rm); err != nil {
+		t.Fatalf("collect: %v", err)
+	}
+	if rm.Resource == nil {
+		t.Fatal("collected resource is nil")
+	}
+
+	if got, ok := ResourceAttribute(rm.Resource, machineIDKey); !ok || got == "" {
+		t.Errorf("herdr.machine.id present=%v value=%q on collected resource, want non-empty", ok, got)
+	}
+	if got, ok := ResourceAttribute(rm.Resource, machineHostnameKey); !ok || got == "" {
+		t.Errorf("herdr.machine.hostname present=%v value=%q on collected resource, want non-empty", ok, got)
 	}
 }

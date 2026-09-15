@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"os"
 
+	"github.com/nabutabu/herdr-scribe/internal/machineid"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/sdk/resource"
 )
@@ -18,6 +20,20 @@ const DefaultServiceName = "herdr-telemetry"
 // a specific semantic-conventions version.
 const serviceNameKey = "service.name"
 
+// Attribute keys for the machine identity attached by BuildResource (3.2).
+// herdr.machine.id is the persisted plugin-generated UUID (never hostname,
+// never a Herdr-native id); herdr.machine.hostname is a secondary display
+// attribute only.
+const (
+	machineIDKey       = "herdr.machine.id"
+	machineHostnameKey = "herdr.machine.hostname"
+
+	// stateDirEnvVar is where the plugin persists herdr.machine.id (0.6, 4.3).
+	// When unset (e.g. standalone dev runs), machine.id is omitted rather than
+	// derived from hostname or a Herdr id.
+	stateDirEnvVar = "HERDR_PLUGIN_STATE_DIR"
+)
+
 // BuildResource constructs the process's OTel resource from the environment:
 //
 //   - OTEL_SERVICE_NAME — set as service.name, taking precedence over any
@@ -26,9 +42,15 @@ const serviceNameKey = "service.name"
 //   - OTEL_RESOURCE_ATTRIBUTES — any user attributes (comma-separated
 //     key=value pairs).
 //   - telemetry.sdk.* metadata from the SDK.
+//   - herdr.machine.id — the persisted UUID from HERDR_PLUGIN_STATE_DIR (3.2),
+//     merged last so it overrides any same-key env attr; omitted with a
+//     warning when the store is unavailable or the env var is unset.
+//   - herdr.machine.hostname — the local hostname (3.2), merged when readable;
+//     omitted with a warning otherwise.
 //
 // When neither source supplies a service.name, DefaultServiceName is applied.
-// Phase 3.2 appends herdr.machine.id / herdr.machine.hostname here.
+// Machine-identity failures degrade per-attribute (warn and omit), never
+// failing the resource as a whole.
 //
 // A malformed OTEL_RESOURCE_ATTRIBUTES entry returns ErrPartialResource; the
 // valid attributes are kept and the partial resource is returned, with the
@@ -51,6 +73,36 @@ func BuildResource(ctx context.Context) (*resource.Resource, error) {
 			return res, err
 		}
 	}
+
+	var attrs []attribute.KeyValue
+
+	if hn, herr := os.Hostname(); herr == nil && hn != "" {
+		attrs = append(attrs, attribute.String(machineHostnameKey, hn))
+	} else {
+		slog.Warn("hostname unavailable; herdr.machine.hostname omitted", "error", herr)
+	}
+
+	stateDir := os.Getenv(stateDirEnvVar)
+	if stateDir == "" {
+		slog.Warn(stateDirEnvVar + " unset; herdr.machine.id omitted (multi-machine grouping unavailable)")
+	} else {
+		id, merr := machineid.LoadOrCreate(stateDir)
+		if merr == nil {
+			attrs = append(attrs, attribute.String(machineIDKey, id))
+		} else {
+			slog.Warn("machine id unavailable; herdr.machine.id omitted", "error", merr)
+		}
+	}
+
+	// Merge last: NewSchemaless has no schema URL (no conflict) and its
+	// attributes win over same-key env attrs via last-value-wins, so the
+	// persisted id always overrides an OTEL_RESOURCE_ATTRIBUTES collision.
+	if len(attrs) > 0 {
+		if res, err = resource.Merge(res, resource.NewSchemaless(attrs...)); err != nil {
+			return res, err
+		}
+	}
+
 	return res, nil
 }
 
