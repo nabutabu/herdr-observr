@@ -9,8 +9,11 @@ import (
 	"log/slog"
 	"time"
 
+	"go.opentelemetry.io/otel/metric"
+
 	"github.com/nabutabu/herdr-scribe/internal/client"
 	"github.com/nabutabu/herdr-scribe/internal/events"
+	"github.com/nabutabu/herdr-scribe/internal/otel"
 	"github.com/nabutabu/herdr-scribe/internal/snapshot"
 	"github.com/nabutabu/herdr-scribe/internal/tracker"
 )
@@ -35,6 +38,15 @@ type App struct {
 	// no such set; only agent_status_changed is per-pane. Read/written solely
 	// on the Run event-loop goroutine — no locking. Nil until Run subscribes.
 	scope *scope
+
+	// meter is the OTel meter for this process's telemetry (Phase 3). Non-nil
+	// only when the OTel SDK initialized successfully; nil means telemetry is
+	// disabled and every instrument method returns a no-op.
+	meter metric.Meter
+
+	// shutdownTelemetry flushes and closes the MeterProvider. Nil when the
+	// SDK never initialized.
+	shutdownTelemetry func(context.Context) error
 }
 
 func New() *App {
@@ -44,6 +56,11 @@ func New() *App {
 // Run drives the process until ctx is cancelled or the subscription stream
 // ends. Any startup failure is returned as an error.
 func (a *App) Run(ctx context.Context) error {
+	// (3.1) Stand up the OTel SDK first so telemetry covers the whole
+	// process lifetime. Failures disable telemetry, never the subscription.
+	a.initTelemetry(ctx)
+	defer a.shutdownTelemetryIfInitialized(context.Background())
+
 	if err := a.ping(ctx); err != nil {
 		return fmt.Errorf("ping herdr: %w", err)
 	}
@@ -177,6 +194,57 @@ func signalResubscribe(ch chan<- struct{}) {
 	select {
 	case ch <- struct{}{}:
 	default:
+	}
+}
+
+// initTelemetry initializes the OTel metrics SDK from the environment (3.1):
+// OTEL_EXPORTER_OTLP_ENDPOINT, OTEL_SERVICE_NAME (default herdr-telemetry),
+// and OTEL_RESOURCE_ATTRIBUTES. The exporter dials lazily, so an unreachable
+// collector shows up as dropped exports, not a startup failure (Phase 5.4);
+// the only errors here are configuration-level, and both are treated the same
+// way: log and run without telemetry.
+func (a *App) initTelemetry(ctx context.Context) {
+	res, err := otel.BuildResource(ctx)
+	if err != nil {
+		slog.Warn("OTel resource init failed; telemetry disabled", "error", err)
+		return
+	}
+	mp, shutdown, err := otel.NewMeterProvider(ctx, res)
+	if err != nil {
+		slog.Warn("OTel SDK init failed; telemetry disabled", "error", err)
+		return
+	}
+	a.meter = mp.Meter(otel.MeterName)
+	a.shutdownTelemetry = shutdown
+	slog.Info("OTel metrics enabled", "service", otel.ServiceName(res))
+	a.registerUpMetric()
+}
+
+// shutdownTelemetryIfInitialized flushes and closes the MeterProvider. Safe to
+// call when telemetry was never initialized.
+func (a *App) shutdownTelemetryIfInitialized(ctx context.Context) {
+	if a.shutdownTelemetry != nil {
+		_ = a.shutdownTelemetry(ctx)
+	}
+}
+
+// registerUpMetric registers the 3.1 proof metric: herdr.up reports 1 for as
+// long as this process is alive and exporting. It doubles as the liveness
+// signal later phases alert on.
+func (a *App) registerUpMetric() {
+	if a.meter == nil {
+		return
+	}
+	_, err := a.meter.Int64ObservableGauge(
+		otel.UpMetricName,
+		metric.WithInt64Callback(func(_ context.Context, o metric.Int64Observer) error {
+			o.Observe(1)
+			return nil
+		}),
+		metric.WithDescription("1 while the herdr-scribe exporter process is running"),
+	)
+	if err != nil {
+		slog.Warn("registering "+otel.UpMetricName+" failed", "error", err)
 	}
 }
 

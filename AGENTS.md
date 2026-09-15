@@ -190,6 +190,11 @@ internal/events/
                                 #   (single-pass classify+normalize)
 internal/snapshot/
   snapshot.go                  # Response/Snapshot/Workspace/Pane/Tab/Agent structs, Fetch()
+internal/otel/
+  resource.go                  # BuildResource: env-driven resource (OTEL_SERVICE_NAME,
+                                #   OTEL_RESOURCE_ATTRIBUTES, herdr-telemetry default)
+  meter.go                     # NewMeterProvider: OTLP/gRPC exporter + periodic reader (3.1),
+                                #   MeterName/UpMetricName consts (herdr.up proof gauge)
 internal/tracker/
   tracker.go                   # Tracker: mutex-guarded workspaces/tabs/panes/agents maps.
                                 #   Per-kind ApplyWorkspaceCreated/.../ApplyAgentStatusChanged/
@@ -304,6 +309,18 @@ Implemented and tested, as of the current `main` branch:
   latency 2m50.806s against a 170.999s wall interval, with counts moving
   (`done`→`working`) and `DurationByState` accumulating the closed done
   interval. See finding #5 for the headless seen-flip limitation.
+- **3.1** — OTel SDK with env-based config (`internal/otel`). `BuildResource`
+  reads `OTEL_SERVICE_NAME` (default `herdr-telemetry`) and
+  `OTEL_RESOURCE_ATTRIBUTES`; `NewMeterProvider` builds an OTLP/gRPC
+  MeterProvider that reads `OTEL_EXPORTER_OTLP_ENDPOINT` from the env, and
+  `app.Run` registers the `herdr.up` proof gauge. Reach-ability live-verified
+  2026-09 against a throwaway OTel Collector (gRPC/4317): `herdr.up`=1 landed
+  with `service.name=herdr-telemetry` and env attributes. Wire fact: the SDK's
+  gRPC exporter dials lazily (`grpc.NewClient`) — construction never fails or
+  blocks on an unreachable collector; exports fail and are dropped instead
+  (this is what Phase 5.4 relies on). None of this requires a live Herdr to
+  test (`go test ./internal/otel/...` uses a manual reader + an unreachable
+  endpoint with a short `OTEL_EXPORTER_OTLP_TIMEOUT`).
 
 **Not yet implemented** — confirmed by `grep`, not just absence from this
 list:
@@ -313,10 +330,11 @@ list:
   `app.subscribeWithBackoff` only covers subscribe/snapshot retries
   *within* a running process — it does not protect against the process
   itself crashing (finding #1). This is the top open item.
-- **Phase 3 (OTel/OTLP export)** — no `otel`/`otlp` import anywhere in the
-  tree yet. `AttentionLatency()` results are currently only logged in
-  `app.Run` (see the `// Phase 3.5 replaces this log` comment there);
-  `Tracker.Counts()` is implemented but nothing reads it yet.
+- **Phase 3 (OTel/OTLP export)** — 3.1 landed (see above); **3.2–3.9 not
+  implemented**: no `herdr.machine.id` attribute yet, and
+  `AttentionLatency()` results are still only logged in `app.Run` (see the
+  `// Phase 3.5 replaces this log` comment there); `Tracker.Counts()` is
+  implemented but nothing reads it yet.
 - **Phase 4 (plugin packaging)** — no `herdr-plugin.toml` in the repo.
 - **Phases 5–6** — reliability hardening and the local demo stack.
 

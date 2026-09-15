@@ -169,6 +169,19 @@ func (t *Tracker) Tabs() map[string]TabState {
 	return tabs
 }
 
+// Agents returns the tracked agent state as a shallow copy. Safe to call from
+// any goroutine; phase 3 exporters snapshot it rather than reading under the
+// tracker lock.
+func (t *Tracker) Agents() map[string]AgentState {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	agents := make(map[string]AgentState, len(t.agents))
+	for k, v := range t.agents {
+		agents[k] = v
+	}
+	return agents
+}
+
 func (t *Tracker) emitAttentionLatency(al AttentionLatency) {
 	select {
 	case t.attentionLatency <- al:

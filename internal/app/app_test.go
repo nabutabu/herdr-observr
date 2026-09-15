@@ -1,6 +1,7 @@
 package app
 
 import (
+	"context"
 	"testing"
 
 	"github.com/nabutabu/herdr-scribe/internal/events"
@@ -69,6 +70,22 @@ func TestSignalResubscribeCoalesces(t *testing.T) {
 		t.Fatal("signals must coalesce into the single-buffer channel")
 	default:
 	}
+}
+
+func TestInitTelemetryRegistersUpGauge(t *testing.T) {
+	// Keep the shutdown flush fast: with no collector running the deferred
+	// export fails after the per-export timeout.
+	t.Setenv("OTEL_EXPORTER_OTLP_TIMEOUT", "500")
+
+	a := New()
+	a.initTelemetry(context.Background())
+	if a.meter == nil {
+		t.Fatal("initTelemetry did not create a meter")
+	}
+	if a.shutdownTelemetry == nil {
+		t.Fatal("initTelemetry did not install the shutdown func")
+	}
+	a.shutdownTelemetryIfInitialized(context.Background())
 }
 
 func TestHandleEventRoutesTabKinds(t *testing.T) {
