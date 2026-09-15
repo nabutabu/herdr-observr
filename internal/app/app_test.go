@@ -78,20 +78,22 @@ func TestSignalResubscribeCoalesces(t *testing.T) {
 	}
 }
 
-func TestInitTelemetryRegistersUpGauge(t *testing.T) {
+func TestNewTelemetryRegistersUpGauge(t *testing.T) {
 	// Keep the shutdown flush fast: with no collector running the deferred
 	// export fails after the per-export timeout.
 	t.Setenv("OTEL_EXPORTER_OTLP_TIMEOUT", "500")
 
-	a := New()
-	a.initTelemetry(context.Background())
-	if a.meter == nil {
-		t.Fatal("initTelemetry did not create a meter")
+	telemetry := NewTelemetry(context.Background())
+	if telemetry == nil {
+		t.Fatal("NewTelemetry did not create telemetry")
 	}
-	if a.shutdownTelemetry == nil {
-		t.Fatal("initTelemetry did not install the shutdown func")
+	if telemetry.meter == nil {
+		t.Fatal("NewTelemetry did not create a meter")
 	}
-	a.shutdownTelemetryIfInitialized(context.Background())
+	if telemetry.shutdown == nil {
+		t.Fatal("NewTelemetry did not install the shutdown func")
+	}
+	telemetry.Shutdown(context.Background())
 }
 
 // drainTransitions replicates Run's select-case consumer, forwarding each
@@ -101,7 +103,7 @@ func drainTransitions(t *testing.T, a *App) {
 	for {
 		select {
 		case tr := <-a.tr.Transitions():
-			a.recordTransition(tr)
+			a.telemetry.recordTransition(tr)
 		default:
 			return
 		}
@@ -115,7 +117,7 @@ func drainStateDurations(t *testing.T, a *App) {
 	for {
 		select {
 		case sd := <-a.tr.StateDurations():
-			a.recordStateDuration(sd)
+			a.telemetry.recordStateDuration(sd)
 		default:
 			return
 		}
@@ -178,9 +180,9 @@ func TestRecordTransitionCounterEventDriven(t *testing.T) {
 	mp := otel.NewMeterProviderWithReader(reader, resource.NewSchemaless(attribute.String("service.name", "test")))
 	defer func() { _ = mp.Shutdown(context.Background()) }()
 
-	a := &App{meter: mp.Meter(otel.MeterName), tr: tracker.NewTracker()}
-	a.registerTransitionCounter()
-	if a.transitions == nil {
+	a := &App{telemetry: &Telemetry{meter: mp.Meter(otel.MeterName)}, tr: tracker.NewTracker()}
+	a.telemetry.registerTransitions()
+	if a.telemetry.transitions == nil {
 		t.Fatal("registerTransitionCounter did not create the counter")
 	}
 
@@ -216,8 +218,8 @@ func TestRecordTransitionCounterSeenFlip(t *testing.T) {
 	mp := otel.NewMeterProviderWithReader(reader, resource.NewSchemaless(attribute.String("service.name", "test")))
 	defer func() { _ = mp.Shutdown(context.Background()) }()
 
-	a := &App{meter: mp.Meter(otel.MeterName), tr: tracker.NewTracker()}
-	a.registerTransitionCounter()
+	a := &App{telemetry: &Telemetry{meter: mp.Meter(otel.MeterName)}, tr: tracker.NewTracker()}
+	a.telemetry.registerTransitions()
 
 	// The silent reconcile-detected close path (2.4): done is flip-flopped to
 	// idle by ApplySeenFlip, exactly as onReport does in production.
@@ -254,7 +256,7 @@ func TestRecordTransitionNoopWithoutTelemetry(t *testing.T) {
 	tr.ApplyAgentStatusChanged(statusEv(snapshot.AgentStatusBlocked))
 	select {
 	case trns := <-tr.Transitions():
-		a.recordTransition(trns)
+		a.telemetry.recordTransition(trns)
 	default:
 		t.Fatal("expected a transition from the tracker")
 	}
@@ -265,9 +267,9 @@ func TestRecordStateDurationHistogramEventDriven(t *testing.T) {
 	mp := otel.NewMeterProviderWithReader(reader, resource.NewSchemaless(attribute.String("service.name", "test")))
 	defer func() { _ = mp.Shutdown(context.Background()) }()
 
-	a := &App{meter: mp.Meter(otel.MeterName), tr: tracker.NewTracker()}
-	a.registerStateDurationHistogram()
-	if a.stateDurationHistogram == nil {
+	a := &App{telemetry: &Telemetry{meter: mp.Meter(otel.MeterName)}, tr: tracker.NewTracker()}
+	a.telemetry.registerStateDurations()
+	if a.telemetry.stateDurationHistogram == nil {
 		t.Fatal("registerStateDurationHistogram did not create the histogram")
 	}
 
@@ -300,8 +302,8 @@ func TestRecordStateDurationHistogramSeenFlip(t *testing.T) {
 	mp := otel.NewMeterProviderWithReader(reader, resource.NewSchemaless(attribute.String("service.name", "test")))
 	defer func() { _ = mp.Shutdown(context.Background()) }()
 
-	a := &App{meter: mp.Meter(otel.MeterName), tr: tracker.NewTracker()}
-	a.registerStateDurationHistogram()
+	a := &App{telemetry: &Telemetry{meter: mp.Meter(otel.MeterName)}, tr: tracker.NewTracker()}
+	a.telemetry.registerStateDurations()
 
 	// The silent reconcile-detected close path (2.4): done is flip-flopped to
 	// idle by ApplySeenFlip, closing the done interval.
@@ -327,8 +329,8 @@ func TestRecordStateDurationHistogramCloseFlush(t *testing.T) {
 	mp := otel.NewMeterProviderWithReader(reader, resource.NewSchemaless(attribute.String("service.name", "test")))
 	defer func() { _ = mp.Shutdown(context.Background()) }()
 
-	a := &App{meter: mp.Meter(otel.MeterName), tr: tracker.NewTracker()}
-	a.registerStateDurationHistogram()
+	a := &App{telemetry: &Telemetry{meter: mp.Meter(otel.MeterName)}, tr: tracker.NewTracker()}
+	a.telemetry.registerStateDurations()
 
 	// Closing a pane mid-state flushes the open interval (2.7 flush-on-close).
 	a.handleEvent(statusEv(snapshot.AgentStatusWorking))
@@ -353,7 +355,7 @@ func TestRecordStateDurationNoopWithoutTelemetry(t *testing.T) {
 	// no-op, never a panic or block.
 	a := &App{tr: tracker.NewTracker()}
 	sd := tracker.StateDuration{PaneID: "w1:p1", WorkspaceID: "w1", Agent: "codex", State: snapshot.AgentStatusWorking}
-	a.recordStateDuration(sd)
+	a.telemetry.recordStateDuration(sd)
 }
 
 func TestHandleEventRoutesTabKinds(t *testing.T) {

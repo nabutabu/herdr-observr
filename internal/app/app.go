@@ -9,12 +9,8 @@ import (
 	"log/slog"
 	"time"
 
-	"go.opentelemetry.io/otel/attribute"
-	"go.opentelemetry.io/otel/metric"
-
 	"github.com/nabutabu/herdr-scribe/internal/client"
 	"github.com/nabutabu/herdr-scribe/internal/events"
-	"github.com/nabutabu/herdr-scribe/internal/otel"
 	"github.com/nabutabu/herdr-scribe/internal/snapshot"
 	"github.com/nabutabu/herdr-scribe/internal/tracker"
 )
@@ -40,23 +36,10 @@ type App struct {
 	// on the Run event-loop goroutine — no locking. Nil until Run subscribes.
 	scope *scope
 
-	// meter is the OTel meter for this process's telemetry (Phase 3). Non-nil
-	// only when the OTel SDK initialized successfully; nil means telemetry is
-	// disabled and every instrument method returns a no-op.
-	meter metric.Meter
-
-	// transitions is the herdr.agent.state.transitions counter (3.3), defined
-	// only when telemetry initialized. Nil means recordTransition no-ops.
-	transitions metric.Int64Counter
-
-	// stateDurationHistogram is the herdr.agent.state.duration histogram (3.4),
-	// defined only when telemetry initialized. Nil means recordStateDuration
-	// no-ops.
-	stateDurationHistogram metric.Float64Histogram
-
-	// shutdownTelemetry flushes and closes the MeterProvider. Nil when the
-	// SDK never initialized.
-	shutdownTelemetry func(context.Context) error
+	// telemetry owns the process's OTel instruments (Phase 3): the meter, the
+	// registered instruments, and the MeterProvider shutdown. Nil means
+	// telemetry is disabled and every record method is a no-op.
+	telemetry *Telemetry
 }
 
 func New() *App {
@@ -68,8 +51,8 @@ func New() *App {
 func (a *App) Run(ctx context.Context) error {
 	// (3.1) Stand up the OTel SDK first so telemetry covers the whole
 	// process lifetime. Failures disable telemetry, never the subscription.
-	a.initTelemetry(ctx)
-	defer a.shutdownTelemetryIfInitialized(context.Background())
+	a.telemetry = NewTelemetry(ctx)
+	defer a.telemetry.Shutdown(context.Background())
 
 	if err := a.ping(ctx); err != nil {
 		return fmt.Errorf("ping herdr: %w", err)
@@ -142,12 +125,12 @@ func (a *App) Run(ctx context.Context) error {
 		case tr := <-a.tr.Transitions():
 			// 3.3: every genuine agent state transition increments the
 			// herdr.agent.state.transitions counter.
-			a.recordTransition(tr)
+			a.telemetry.recordTransition(tr)
 
 		case sd := <-a.tr.StateDurations():
 			// 3.4: every closed state interval records one
 			// herdr.agent.state.duration histogram sample.
-			a.recordStateDuration(sd)
+			a.telemetry.recordStateDuration(sd)
 
 		case <-resubscribe:
 			// Silent-stream guard (0.4): the socket is healthy but the event
@@ -215,122 +198,6 @@ func signalResubscribe(ch chan<- struct{}) {
 	case ch <- struct{}{}:
 	default:
 	}
-}
-
-// initTelemetry initializes the OTel metrics SDK from the environment (3.1):
-// OTEL_EXPORTER_OTLP_ENDPOINT, OTEL_SERVICE_NAME (default herdr-telemetry),
-// and OTEL_RESOURCE_ATTRIBUTES. The exporter dials lazily, so an unreachable
-// collector shows up as dropped exports, not a startup failure (Phase 5.4);
-// the only errors here are configuration-level, and both are treated the same
-// way: log and run without telemetry.
-func (a *App) initTelemetry(ctx context.Context) {
-	res, err := otel.BuildResource(ctx)
-	if err != nil {
-		slog.Warn("OTel resource init failed; telemetry disabled", "error", err)
-		return
-	}
-	mp, shutdown, err := otel.NewMeterProvider(ctx, res)
-	if err != nil {
-		slog.Warn("OTel SDK init failed; telemetry disabled", "error", err)
-		return
-	}
-	a.meter = mp.Meter(otel.MeterName)
-	a.shutdownTelemetry = shutdown
-	slog.Info("OTel metrics enabled", "service", otel.ServiceName(res))
-	a.registerUpMetric()
-	a.registerTransitionCounter()
-	a.registerStateDurationHistogram()
-}
-
-// shutdownTelemetryIfInitialized flushes and closes the MeterProvider. Safe to
-// call when telemetry was never initialized.
-func (a *App) shutdownTelemetryIfInitialized(ctx context.Context) {
-	if a.shutdownTelemetry != nil {
-		_ = a.shutdownTelemetry(ctx)
-	}
-}
-
-// registerUpMetric registers the 3.1 proof metric: herdr.up reports 1 for as
-// long as this process is alive and exporting. It doubles as the liveness
-// signal later phases alert on.
-func (a *App) registerUpMetric() {
-	if a.meter == nil {
-		return
-	}
-	_, err := a.meter.Int64ObservableGauge(
-		otel.UpMetricName,
-		metric.WithInt64Callback(func(_ context.Context, o metric.Int64Observer) error {
-			o.Observe(1)
-			return nil
-		}),
-		metric.WithDescription("1 while the herdr-scribe exporter process is running"),
-	)
-	if err != nil {
-		slog.Warn("registering "+otel.UpMetricName+" failed", "error", err)
-	}
-}
-
-// registerTransitionCounter registers the 3.3 herdr.agent.state.transitions
-// counter. Registration failure (e.g. a stale meter) disables the counter,
-// never the subscription.
-func (a *App) registerTransitionCounter() {
-	if a.meter == nil {
-		return
-	}
-	counter, err := otel.NewTransitionCounter(a.meter)
-	if err != nil {
-		slog.Warn("registering "+otel.TransitionMetricName+" failed", "error", err)
-		return
-	}
-	a.transitions = counter
-}
-
-// recordTransition increments herdr.agent.state.transitions for one genuine
-// agent state transition, tagged by agent.type and previous/new state. A nil
-// counter (telemetry disabled or registration failed) is a no-op.
-func (a *App) recordTransition(tr tracker.AgentTransition) {
-	if a.transitions == nil {
-		return
-	}
-	a.transitions.Add(context.Background(), 1,
-		metric.WithAttributes(
-			attribute.String(otel.AgentTypeKey, tr.Agent),
-			attribute.String(otel.AgentPreviousState, string(tr.Previous)),
-			attribute.String(otel.AgentStateKey, string(tr.New)),
-		),
-	)
-}
-
-// registerStateDurationHistogram registers the 3.4 herdr.agent.state.duration
-// histogram. Registration failure (e.g. a stale meter) disables the histogram,
-// never the subscription.
-func (a *App) registerStateDurationHistogram() {
-	if a.meter == nil {
-		return
-	}
-	hist, err := otel.NewDurationHistogram(a.meter)
-	if err != nil {
-		slog.Warn("registering "+otel.DurationMetricName+" failed", "error", err)
-		return
-	}
-	a.stateDurationHistogram = hist
-}
-
-// recordStateDuration records one herdr.agent.state.duration histogram sample
-// for a closed state interval, tagged by agent.type and the state whose
-// interval just closed. A nil histogram (telemetry disabled or registration
-// failed) is a no-op. Durations are recorded in seconds per the instrument
-// unit (3.4).
-func (a *App) recordStateDuration(sd tracker.StateDuration) {
-	if a.stateDurationHistogram == nil {
-		return
-	}
-	a.stateDurationHistogram.Record(context.Background(), sd.Duration.Seconds(),
-		metric.WithAttributes(
-			attribute.String(otel.AgentTypeKey, sd.Agent),
-			attribute.String(otel.AgentStateKey, string(sd.State)),
-		),
-	)
 }
 
 func (a *App) ping(ctx context.Context) error {

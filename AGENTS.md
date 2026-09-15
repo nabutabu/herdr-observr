@@ -330,8 +330,9 @@ Implemented and tested, as of the current `main` branch:
   `herdr.agent.type` attributes listed in the plan's 3.2 belong on metric
   events/datapoints (3.8), not the resource, and are not wired yet.
 - **3.3** — `herdr.agent.state.transitions` counter
-  (`internal/otel/meter.go`'s `TransitionMetricName`, `App` registers it via
-  `registerTransitionCounter`/`recordTransition`). The tracker surfaces genuine
+  (`internal/otel/meter.go`'s `TransitionMetricName`, the `Telemetry` type in
+  `internal/app/telemetry.go` registers it via
+  `registerTransitions`/`recordTransition`). The tracker surfaces genuine
   transitions through a new `AgentTransition` channel (`Tracker.Transitions()`,
   mirroring `AttentionLatency`): emitted by `ApplyAgentStatusChanged` on every
   real event-driven change and by `ApplySeenFlip` on the silent done→idle
@@ -341,7 +342,7 @@ Implemented and tested, as of the current `main` branch:
   cardinality by construction (no pane/workspace id).
 - **3.4** — `herdr.agent.state.duration` histogram
   (`internal/otel/meter.go`'s `DurationMetricName`, `NewDurationHistogram`,
-  unit `s`; `App` registers it via `registerStateDurationHistogram`/
+  unit `s`; `Telemetry` registers it via `registerStateDurations`/
   `recordStateDuration`). The tracker surfaces each *closed* state interval at
   the moment it closes through a new `StateDuration` channel
   (`Tracker.StateDurations()`), recording one histogram sample tagged
