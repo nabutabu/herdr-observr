@@ -198,6 +198,80 @@ func TestAttentionLatencyHistogramRegistersAndRecords(t *testing.T) {
 	}
 }
 
+func TestAgentCountGaugesRegisterAndObserve(t *testing.T) {
+	// (3.6) Pin the five gauge metric names, their unit, and the int64
+	// observable-gauge behavior. A callback observes explicitly (values shown
+	// include a zero) to prove presence and shape; the app-layer test drives
+	// real tracker counts through them.
+	setCleanEnv(t)
+
+	res, err := BuildResource(context.Background())
+	if err != nil {
+		t.Fatalf("BuildResource: %v", err)
+	}
+
+	reader := metric.NewManualReader()
+	mp := newMeterProviderWithReader(reader, res)
+	defer func() { _ = mp.Shutdown(context.Background()) }()
+
+	gauges, err := NewAgentCountGauges(mp.Meter(MeterName))
+	if err != nil {
+		t.Fatalf("NewAgentCountGauges: %v", err)
+	}
+
+	_, err = mp.Meter(MeterName).RegisterCallback(func(_ context.Context, o otmetric.Observer) error {
+		o.ObserveInt64(gauges.Active, 3)
+		o.ObserveInt64(gauges.Blocked, 1)
+		o.ObserveInt64(gauges.Idle, 0)
+		o.ObserveInt64(gauges.Done, 2)
+		o.ObserveInt64(gauges.Unknown, 0)
+		return nil
+	}, gauges.Active, gauges.Blocked, gauges.Idle, gauges.Done, gauges.Unknown)
+	if err != nil {
+		t.Fatalf("RegisterCallback: %v", err)
+	}
+
+	var rm metricdata.ResourceMetrics
+	if err := reader.Collect(context.Background(), &rm); err != nil {
+		t.Fatalf("collect: %v", err)
+	}
+
+	want := map[string]int64{
+		ActiveAgentsMetricName:  3,
+		BlockedAgentsMetricName: 1,
+		IdleAgentsMetricName:    0,
+		DoneAgentsMetricName:    2,
+		UnknownAgentsMetricName: 0,
+	}
+	for name, wantValue := range want {
+		seen := false
+		for _, sm := range rm.ScopeMetrics {
+			for _, m := range sm.Metrics {
+				if m.Name != name {
+					continue
+				}
+				seen = true
+				if m.Unit != "1" {
+					t.Errorf("unit = %q, want %q", m.Unit, "1")
+				}
+				g, ok := m.Data.(metricdata.Gauge[int64])
+				if !ok {
+					t.Fatalf("data type = %T, want Gauge[int64]", m.Data)
+				}
+				if len(g.DataPoints) != 1 || g.DataPoints[0].Value != wantValue {
+					t.Errorf("datapoints = %+v, want a single value %d", g.DataPoints, wantValue)
+				}
+				if len(g.DataPoints[0].Attributes.ToSlice()) != 0 {
+					t.Errorf("expected attribute-free datapoints, got %v", g.DataPoints[0].Attributes)
+				}
+			}
+		}
+		if !seen {
+			t.Errorf("metric %q not found in collected data", name)
+		}
+	}
+}
+
 func TestNewMeterProviderWithUnreachableEndpoint(t *testing.T) {
 	// The gRPC connection is established lazily, so construction must succeed
 	// even when the collector is unreachable (Phase 5.4): exports fail and are

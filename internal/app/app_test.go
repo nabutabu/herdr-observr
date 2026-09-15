@@ -175,6 +175,38 @@ func findFloat64HistogramPoints(t *testing.T, rm metricdata.ResourceMetrics, nam
 	return out
 }
 
+func findInt64GaugePoints(t *testing.T, rm metricdata.ResourceMetrics, name string) []metricdata.DataPoint[int64] {
+	t.Helper()
+	var out []metricdata.DataPoint[int64]
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			if m.Name != name {
+				continue
+			}
+			g, ok := m.Data.(metricdata.Gauge[int64])
+			if !ok {
+				t.Fatalf("metric %s data type = %T, want Gauge[int64]", name, m.Data)
+			}
+			out = append(out, g.DataPoints...)
+		}
+	}
+	return out
+}
+
+// gaugeValues splits a gauge's datapoints into the attribute-free global point
+// and a per-workspace map keyed by herdr.workspace.id.
+func gaugeValues(points []metricdata.DataPoint[int64]) (global int64, byWorkspace map[string]int64) {
+	byWorkspace = map[string]int64{}
+	for _, p := range points {
+		if ws, ok := p.Attributes.Value(attribute.Key(otel.WorkspaceIDKey)); ok {
+			byWorkspace[ws.AsString()] = p.Value
+		} else {
+			global = p.Value
+		}
+	}
+	return
+}
+
 func attrString(t *testing.T, s attribute.Set, key string) string {
 	t.Helper()
 	v, ok := s.Value(attribute.Key(key))
@@ -470,6 +502,89 @@ func TestRecordAttentionLatencyNoopWithoutTelemetry(t *testing.T) {
 	a := &App{tr: tracker.NewTracker()}
 	al := tracker.AttentionLatency{PaneID: "w1:p1", WorkspaceID: "w1", Agent: "codex"}
 	a.telemetry.recordAttentionLatency(al)
+}
+
+func TestAgentCountGaugesEventDriven(t *testing.T) {
+	reader := metric.NewManualReader()
+	mp := otel.NewMeterProviderWithReader(reader, resource.NewSchemaless(attribute.String("service.name", "test")))
+	defer func() { _ = mp.Shutdown(context.Background()) }()
+
+	a := &App{telemetry: &Telemetry{meter: mp.Meter(otel.MeterName)}, tr: tracker.NewTracker()}
+	a.telemetry.registerAgentCounts(a.tr.Counts)
+
+	// Drive the tracker through the same handleEvent path as production via
+	// status events spread across two workspaces.
+	ws1, ws2 := "w1", "w2"
+	status := func(state snapshot.AgentStatus, paneID, wsID string) events.NormalizedEvent {
+		return events.NormalizedEvent{Kind: events.KindAgentStatusChanged, PaneID: paneID, WorkspaceID: wsID, Agent: "codex", NewState: state}
+	}
+	a.handleEvent(status(snapshot.AgentStatusWorking, "w1:p1", ws1)) // first seen: working=1
+	a.handleEvent(status(snapshot.AgentStatusBlocked, "w1:p2", ws1)) // blocked=1
+	a.handleEvent(status(snapshot.AgentStatusWorking, "w2:p1", ws2)) // working=2
+
+	var rm metricdata.ResourceMetrics
+	if err := reader.Collect(context.Background(), &rm); err != nil {
+		t.Fatalf("collect: %v", err)
+	}
+
+	active := findInt64GaugePoints(t, rm, otel.ActiveAgentsMetricName)
+	if len(active) != 3 {
+		t.Fatalf("active datapoints = %d, want 3 (global + one per workspace)", len(active))
+	}
+	global, byWs := gaugeValues(active)
+	if global != 2 {
+		t.Errorf("active global = %d, want 2", global)
+	}
+	if byWs[ws1] != 1 || byWs[ws2] != 1 {
+		t.Errorf("active per-workspace = %+v, want w1=1 w2=1", byWs)
+	}
+
+	blocked := findInt64GaugePoints(t, rm, otel.BlockedAgentsMetricName)
+	global, byWs = gaugeValues(blocked)
+	if global != 1 {
+		t.Errorf("blocked global = %d, want 1", global)
+	}
+	// A workspace with no blocked agents still emits an explicit 0 (series
+	// stability), not an absent datapoint.
+	if byWs[ws1] != 1 || byWs[ws2] != 0 {
+		t.Errorf("blocked per-workspace = %+v, want w1=1 w2=0", byWs)
+	}
+
+	// Zero-count states must still emit an explicit 0 globally.
+	idle := findInt64GaugePoints(t, rm, otel.IdleAgentsMetricName)
+	if global, _ = gaugeValues(idle); global != 0 {
+		t.Errorf("idle global = %d, want 0", global)
+	}
+	done := findInt64GaugePoints(t, rm, otel.DoneAgentsMetricName)
+	if global, byWs = gaugeValues(done); global != 0 {
+		t.Errorf("done global = %d, want 0", global)
+	}
+	if len(byWs) != 2 {
+		t.Errorf("done per-workspace entries = %d, want 2 (w1, w2)", len(byWs))
+	}
+
+	// Closing a pane decrements its workspace and global counts immediately
+	// (2.7), reflected on the next collection — no per-event gauge writes.
+	a.handleEvent(events.NormalizedEvent{Kind: events.KindPaneClosed, PaneID: "w1:p1"})
+	if err := reader.Collect(context.Background(), &rm); err != nil {
+		t.Fatalf("collect after close: %v", err)
+	}
+	active = findInt64GaugePoints(t, rm, otel.ActiveAgentsMetricName)
+	global, byWs = gaugeValues(active)
+	if global != 1 {
+		t.Errorf("active global after close = %d, want 1", global)
+	}
+	if byWs[ws1] != 0 || byWs[ws2] != 1 {
+		t.Errorf("active per-workspace after close = %+v, want w1=0 w2=1", byWs)
+	}
+}
+
+func TestAgentCountGaugesNoopWithoutTelemetry(t *testing.T) {
+	// Telemetry disabled (nil meter): registering the gauges must be a no-op,
+	// never a panic or block.
+	a := &App{tr: tracker.NewTracker()}
+	a.telemetry.registerAgentCounts(a.tr.Counts)
+	a.tr.ApplyAgentStatusChanged(events.NormalizedEvent{Kind: events.KindAgentStatusChanged, PaneID: "w1:p1", WorkspaceID: "w1", Agent: "codex", NewState: snapshot.AgentStatusWorking})
 }
 
 func TestHandleEventRoutesTabKinds(t *testing.T) {

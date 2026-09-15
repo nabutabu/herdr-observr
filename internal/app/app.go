@@ -69,6 +69,13 @@ func (a *App) Run(ctx context.Context) error {
 	a.tr = tracker.NewTracker()
 	a.tr.ApplySnapshot(resp.Snapshot)
 
+	// (3.6) Wire the live concurrency counts (2.6) to the herdr.agent.*
+	// gauges. Registered here rather than in NewTelemetry because the tracker
+	// — the counts source — only exists after bootstrap. a.tr.Counts binds the
+	// tracker pointer before the SDK's first collection (10s interval), so
+	// there is no race; the callback reads under the tracker's own lock.
+	a.telemetry.registerAgentCounts(a.tr.Counts)
+
 	// Reconciled diffs reach this callback (still running on the loop
 	// goroutine). It never touches `sub` — subscription teardown stays owned by
 	// Run's event loop. A report carries either genuine drift (the only signal

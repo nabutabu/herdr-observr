@@ -72,6 +72,37 @@ const (
 	AttentionLatencyMetricName = "herdr.agent.attention_latency"
 )
 
+// (3.6) herdr.agent.{active,blocked,idle,done,unknown} — observable gauges of
+// the live per-state agent counts (2.6). herdr.agent.active holds the working
+// count; done/unknown are gauged too so all five states are visible. Each
+// gauge observes a global datapoint plus one per workspace carrying
+// WorkspaceIDKey. Note: the plan originally gated the per-workspace datapoints
+// behind a config flag (default off) as a cardinality caution; the decision
+// taken during implementation is to always emit them — bounded at
+// 5 x N_workspaces series per machine, and revisit-able when Phase 4.2 config
+// lands. Aggregate counts only; no agent/pane ids participate.
+const (
+	// ActiveAgentsMetricName is the 3.6 gauge for agents currently working.
+	ActiveAgentsMetricName = "herdr.agent.active"
+
+	// BlockedAgentsMetricName is the 3.6 gauge for blocked agents.
+	BlockedAgentsMetricName = "herdr.agent.blocked"
+
+	// IdleAgentsMetricName is the 3.6 gauge for idle agents.
+	IdleAgentsMetricName = "herdr.agent.idle"
+
+	// DoneAgentsMetricName is the 3.6 gauge for done agents.
+	DoneAgentsMetricName = "herdr.agent.done"
+
+	// UnknownAgentsMetricName is the 3.6 gauge for unknown-state agents.
+	UnknownAgentsMetricName = "herdr.agent.unknown"
+
+	// WorkspaceIDKey is the herdr.workspace.id attribute key. Shared with 3.7
+	// (herdr.workspace.agent.concurrent) and 3.8 (per-transition events) so all
+	// per-workspace datapoints use the one key.
+	WorkspaceIDKey = "herdr.workspace.id"
+)
+
 // NewMeterProvider initializes the OTel metrics SDK with the OTLP/gRPC
 // exporter and associates it with res.
 //
@@ -158,4 +189,52 @@ func NewAttentionLatencyHistogram(meter apimetric.Meter) (apimetric.Float64Histo
 		apimetric.WithUnit("s"),
 		apimetric.WithDescription("Closed done-but-unseen (attention latency) intervals, tagged by agent type"),
 	)
+}
+
+// AgentCountGauges holds the five 3.6 state-count gauges. The state each gauge
+// measures is fixed by its metric name (Active=herdr.agent.active,
+// Blocked=..., Idle=..., Done=..., Unknown=...), so no state attribute is
+// needed on datapoints. Created bare — without a collection callback — and
+// registered app-side via meter.RegisterCallback (internal/app/telemetry.go),
+// which maps tracker.AgentCounts onto them in one snapshot pass.
+type AgentCountGauges struct {
+	Active  apimetric.Int64ObservableGauge
+	Blocked apimetric.Int64ObservableGauge
+	Idle    apimetric.Int64ObservableGauge
+	Done    apimetric.Int64ObservableGauge
+	Unknown apimetric.Int64ObservableGauge
+}
+
+// NewAgentCountGauges registers the five 3.6 gauges on meter and returns them,
+// or an error if any registration failed. The returned gauges are no-ops when
+// the meter itself is a no-op (telemetry disabled). Counts are observed with
+// unit "1" (number of agents), one datapoint per state running on the SDK's
+// collection cadence — no per-event writes, so gauge freshness follows the
+// periodic reader's exportInterval.
+func NewAgentCountGauges(meter apimetric.Meter) (AgentCountGauges, error) {
+	create := func(name, desc string) (apimetric.Int64ObservableGauge, error) {
+		return meter.Int64ObservableGauge(name, apimetric.WithUnit("1"), apimetric.WithDescription(desc))
+	}
+
+	active, err := create(ActiveAgentsMetricName, "Number of agents currently working")
+	if err != nil {
+		return AgentCountGauges{}, err
+	}
+	blocked, err := create(BlockedAgentsMetricName, "Number of agents currently blocked")
+	if err != nil {
+		return AgentCountGauges{}, err
+	}
+	idle, err := create(IdleAgentsMetricName, "Number of agents currently idle")
+	if err != nil {
+		return AgentCountGauges{}, err
+	}
+	done, err := create(DoneAgentsMetricName, "Number of agents currently done (finished, awaiting human)")
+	if err != nil {
+		return AgentCountGauges{}, err
+	}
+	unknown, err := create(UnknownAgentsMetricName, "Number of agents in the transient/unknown state")
+	if err != nil {
+		return AgentCountGauges{}, err
+	}
+	return AgentCountGauges{Active: active, Blocked: blocked, Idle: idle, Done: done, Unknown: unknown}, nil
 }

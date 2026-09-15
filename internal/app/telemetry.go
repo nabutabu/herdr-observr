@@ -11,6 +11,7 @@ import (
 	"go.opentelemetry.io/otel/metric"
 
 	"github.com/nabutabu/herdr-scribe/internal/otel"
+	"github.com/nabutabu/herdr-scribe/internal/snapshot"
 	"github.com/nabutabu/herdr-scribe/internal/tracker"
 )
 
@@ -190,4 +191,62 @@ func (t *Telemetry) recordAttentionLatency(al tracker.AttentionLatency) {
 			attribute.String(otel.AgentTypeKey, al.Agent),
 		),
 	)
+}
+
+// registerAgentCounts registers the 3.6 herdr.agent.{active,blocked,idle,done,
+// unknown} gauges and wires them to the tracker's live concurrency counts
+// (2.6). Called from App.Run once the tracker exists — unlike the 3.3–3.5
+// instruments it needs a counts source, so it is not part of NewTelemetry.
+// Registration failure (e.g. a stale meter) disables the gauges, never the
+// subscription.
+func (t *Telemetry) registerAgentCounts(counts func() tracker.AgentCounts) {
+	if t == nil || t.meter == nil {
+		return
+	}
+	gauges, err := otel.NewAgentCountGauges(t.meter)
+	if err != nil {
+		slog.Warn("registering agent count gauges failed", "error", err)
+		return
+	}
+
+	// stateGauges maps each tracked agent state to its 3.6 gauge; the gauge's
+	// metric name already encodes the state, so datapoints need no state
+	// attribute. Active is the working count; done/unknown are gauged too so
+	// all five model states are visible.
+	stateGauges := []struct {
+		gauge metric.Int64ObservableGauge
+		state snapshot.AgentStatus
+	}{
+		{gauges.Active, snapshot.AgentStatusWorking},
+		{gauges.Blocked, snapshot.AgentStatusBlocked},
+		{gauges.Idle, snapshot.AgentStatusIdle},
+		{gauges.Done, snapshot.AgentStatusDone},
+		{gauges.Unknown, snapshot.AgentStatusUnknown},
+	}
+
+	// One callback serves all five gauges so the tracker's Counts() (deep-copy
+	// snapshot under its own lock) is taken once per collection, not five
+	// times. Each gauge observes a global datapoint plus one per workspace
+	// carrying herdr.workspace.id — always emitted (bounded at 5 x N_workspaces
+	// per machine; see NewAgentCountGauges for the config-flag note). Absent
+	// map entries read as zero, so empty states still emit an explicit 0 and
+	// their Prometheus series never go stale.
+	_, err = t.meter.RegisterCallback(func(ctx context.Context, o metric.Observer) error {
+		c := counts()
+		for _, sg := range stateGauges {
+			o.ObserveInt64(sg.gauge, int64(c.Global[sg.state]))
+			// Observe every state for each workspace that has any agents, not
+			// just the states present in its bucket, so per-workspace series
+			// stay present across state changes.
+			for wsID, wsCounts := range c.Workspace {
+				o.ObserveInt64(sg.gauge, int64(wsCounts[sg.state]),
+					metric.WithAttributes(attribute.String(otel.WorkspaceIDKey, wsID)),
+				)
+			}
+		}
+		return nil
+	}, gauges.Active, gauges.Blocked, gauges.Idle, gauges.Done, gauges.Unknown)
+	if err != nil {
+		slog.Warn("registering agent count gauge callback failed", "error", err)
+	}
 }
