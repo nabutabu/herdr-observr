@@ -169,7 +169,8 @@ bearing for the current design. Treat them as constraints, not suggestions:
 ## Architecture (current)
 
 ```
-main.go                        # entrypoint: signal handling, delegates to internal/app
+main.go                        # entrypoint: signal handling, config.Load() (warn-on-error),
+                                #   delegates to internal/app
 internal/app/app.go            # process lifecycle: ping → bootstrap snapshot → subscribe →
                                 #   event loop → reconnect-on-error → reconciliation-driven
                                 #   resubscribe → pane.created-triggered resubscribe
@@ -177,6 +178,10 @@ internal/app/scope.go          # App's live subscription state: the subscribed-p
                                 #   pane.agent_status_changed, seeded by SubscribeFromSnapshot
                                 #   and replaced wholesale on every (re)subscribe
 internal/app/app_test.go       # scope + resubscribe-trigger + event-routing tests
+internal/config/
+  config.go                    # 4.2 typed Config (presence-aware pointer fields), FromPairs,
+                                #   Load (HERDR_PLUGIN_CONFIG_DIR/.env), defaults
+  envfile.go                   # .env parser + comma-separated key=value attr/header helpers
 internal/client/
   client.go                    # Dial, SocketPath (HERDR_SOCKET_PATH), one-shot Call()
   rpc.go                       # Request/Response wire types, WriteFrame/ReadFrame (NDJSON framing)
@@ -380,9 +385,12 @@ Implemented and tested, as of the current `main` branch:
   gauge observes a global datapoint plus one per workspace carrying
   `herdr.workspace.id`; 3.7 is per-workspace only (working+blocked sum, the
   mission's "concurrent agent work"). Both always emit explicit zeros, so
-  per-workspace series never go stale — the config flag the plan's cardinality
-  caution suggested was deliberately dropped in favor of always-emit,
-  revisit-able when Phase 4.2 config lands.
+  per-workspace series never go stale. The 4.2 config flag
+  `HERDR_OBSRVR_EMIT_PER_WORKSPACE_GAUGES` (default true — the plan's original
+  default-off cardinality caution was dropped in favor of always-emit,
+  revisit-able when the flag landed) is the backward-compatible opt-out:
+  false collapses the 3.6 gauges to global-only datapoints and skips
+  registering the 3.7 gauge entirely.
 - **3.8** — structured state-change *events* over the OTLP Logs signal
   (`internal/otel/log.go`'s `NewLoggerProvider` (otlploggrpc exporter, batch
   processor, ~1s cadence, lazy-dial like the metrics path) and
@@ -399,6 +407,32 @@ Implemented and tested, as of the current `main` branch:
   carries one. Event records are transient logs, not long-lived series, so the
   high-cardinality ids are fine un-gated (no 3.6-style config flag). Requires
   a `logs:` pipeline in the Phase 6 collector.
+- **3.9** — short `herdr.agent.state_change` root spans over the OTLP Traces
+  signal (`internal/otel/trace.go`'s `NewTracerProvider` (lazy-dial OTLP/gRPC
+  trace exporter + batch span processor) and `NewTracerProviderWithProcessor`
+  test seam; `Telemetry.registerTracers`/`recordTransitionSpan`). Shares the
+  `Transitions()` feed and `StateChangeEventName` with 3.8: each genuine
+  transition starts a root span at the transition's observed time and ends it
+  immediately. One note: `sdk/trace` ships inside the already-required
+  `go.opentelemetry.io/otel/sdk` module — only the `otlptracegrpc` exporter
+  package was added to go.mod.
+- **4.2 (config file)** — `internal/config` reads a `.env` from
+  `HERDR_PLUGIN_CONFIG_DIR` (stdlib parser, no new dependency, warn-and-skip
+  per malformed line/unknown key — a bad config can never stop the daemon).
+  Every recognized key is presence-aware (`*string`/`*bool`/`*time.Duration`):
+  keys absent from the file fall back to process env / OTel SDK defaults
+  (precedence: config file > process env > built-in). `OTLP.InsecureDefault()`
+  defaults **true** (the historical hard-coded `WithInsecure()`), so TLS is
+  on only when the config file explicitly sets `OTEL_EXPORTER_OTLP_INSECURE=
+  false` — deliberately the *only* supported TLS switch, since OTel exporters
+  expose no force-TLS override and a shell env bool can't compose (see
+  `metricOTLPOptions`/`logOTLPOptions`/`traceOTLPOptions`, which pass exporter
+  options only for keys the file set). The three otel constructors and
+  `BuildResource` take a variadic `cfg ...*config.Config` so existing call
+  sites compile unchanged; `main.go` calls `config.Load()` (warn-on-error →
+  nil) into `app.New(cfg)`. `BuildResource` honors config-file `service.name`
+  / `OTEL_RESOURCE_ATTRIBUTES` / `HERDR_OBSRVR_MACHINE_ID` override (beats
+  even the persisted machine UUID). Example config: `example.env`.
 
 **Not yet implemented** — confirmed by `grep`, not just absence from this
 list:
@@ -408,18 +442,6 @@ list:
   `app.subscribeWithBackoff` only covers subscribe/snapshot retries
   *within* a running process — it does not protect against the process
   itself crashing (finding #1). This is the top open item.
-- **Phase 3 (OTel/OTLP export)** — 3.1, 3.2 (resource attributes), **3.3**,
-  **3.4**, **3.5**, **3.6**/**3.7**, **3.8**, and **3.9** all landed (see
-  above). 3.9 (short `herdr.agent.state_change` root spans over the OTLP
-  Traces signal, started at the transition's observed time and ended
-  immediately) shares the `Transitions()` feed and `StateChangeEventName`
-  with 3.8, emitting through `internal/otel/trace.go`'s
-  `NewTracerProvider` (lazy-dial OTLP/gRPC trace exporter + batch span
-  processor) into `Telemetry.recordTransitionSpan`. One note: `sdk/trace`
-  ships inside the already-required `go.opentelemetry.io/otel/sdk` module —
-  only the `otlptracegrpc` exporter package was added to go.mod.
-- **Phase 4 (plugin packaging)** — no `herdr-plugin.toml` in the repo.
-- **Phases 5–6** — reliability hardening and the local demo stack.
 
 ## Conventions
 
@@ -485,5 +507,8 @@ at a real running Herdr — not as part of `go test ./...`.
 
 - Go 1.26+
 - `HERDR_SOCKET_PATH` — required; path to Herdr's Unix socket
+- `HERDR_PLUGIN_CONFIG_DIR` — optional; directory for the plugin's `.env`
+  config file (4.2). Keys set there override the process env (see
+  `internal/config`). Unset → pure env-driven behavior.
 - `HERDR_PLUGIN_STATE_DIR` — where the persisted `herdr.machine.id` UUID
-  will live once Phase 4 packaging lands (not yet wired up)
+  lives (read by `internal/otel/resource.go` via `machineid.LoadOrCreate`)

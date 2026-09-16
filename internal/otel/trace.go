@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/nabutabu/herdr-observr/internal/config"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
 	"go.opentelemetry.io/otel/sdk/resource"
@@ -41,9 +42,10 @@ const (
 //
 // The exporter reads its whole configuration from the environment (the same
 // OTEL_EXPORTER_OTLP_* variables as the metrics/logs exporters; traces ride
-// the /v1/traces path of the same endpoint), so no endpoint plumbing is needed
-// here. WithInsecure pins the SDK to a plaintext local collector, mirroring
-// NewMeterProvider and NewLoggerProvider.
+// the /v1/traces path of the same endpoint). A 4.2 plugin config file
+// overrides the keys it explicitly sets, exactly like the metrics and logs
+// paths (see NewMeterProvider and traceOTLPOptions); traces TLS/insecure
+// follow the same config-file-driven rule.
 //
 // The gRPC connection is established lazily (grpc.NewClient): construction
 // never blocks or fails because the collector is unreachable — export batches
@@ -56,8 +58,8 @@ const (
 // an error (configuration-level failure only) should log and continue without
 // span telemetry rather than aborting the process — exactly the metrics path's
 // behavior.
-func NewTracerProvider(ctx context.Context, res *resource.Resource) (apitrace.TracerProvider, func(context.Context) error, error) {
-	exporter, err := otlptracegrpc.New(ctx, otlptracegrpc.WithInsecure())
+func NewTracerProvider(ctx context.Context, res *resource.Resource, cfg ...*config.Config) (apitrace.TracerProvider, func(context.Context) error, error) {
+	exporter, err := otlptracegrpc.New(ctx, traceOTLPOptions(firstConfig(cfg))...)
 	if err != nil {
 		return nil, nil, fmt.Errorf("creating OTLP gRPC traces exporter: %w", err)
 	}
@@ -86,4 +88,27 @@ func newTracerProviderWithProcessor(processor sdktrace.SpanProcessor, res *resou
 // production code should use NewTracerProvider.
 func NewTracerProviderWithProcessor(processor sdktrace.SpanProcessor, res *resource.Resource) *sdktrace.TracerProvider {
 	return newTracerProviderWithProcessor(processor, res)
+}
+
+// traceOTLPOptions is the traces analogue of metricOTLPOptions: exporter
+// options only for keys the 4.2 config file explicitly set, and the historical
+// plaintext WithInsecure() pin when there is no config.
+func traceOTLPOptions(c *config.Config) []otlptracegrpc.Option {
+	if c == nil {
+		return []otlptracegrpc.Option{otlptracegrpc.WithInsecure()}
+	}
+	var opts []otlptracegrpc.Option
+	if c.OTLP.InsecureDefault() {
+		opts = append(opts, otlptracegrpc.WithInsecure())
+	}
+	if c.OTLP.Endpoint != nil {
+		opts = append(opts, otlptracegrpc.WithEndpoint(*c.OTLP.Endpoint))
+	}
+	if c.OTLP.Timeout != nil {
+		opts = append(opts, otlptracegrpc.WithTimeout(*c.OTLP.Timeout))
+	}
+	if c.OTLP.Headers != nil {
+		opts = append(opts, otlptracegrpc.WithHeaders(config.ParseHeaders(*c.OTLP.Headers)))
+	}
+	return opts
 }

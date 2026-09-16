@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/nabutabu/herdr-observr/internal/config"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetricgrpc"
 	apimetric "go.opentelemetry.io/otel/metric"
@@ -76,11 +77,12 @@ const (
 // the live per-state agent counts (2.6). herdr.agent.active holds the working
 // count; done/unknown are gauged too so all five states are visible. Each
 // gauge observes a global datapoint plus one per workspace carrying
-// WorkspaceIDKey. Note: the plan originally gated the per-workspace datapoints
-// behind a config flag (default off) as a cardinality caution; the decision
-// taken during implementation is to always emit them — bounded at
-// 5 x N_workspaces series per machine, and revisit-able when Phase 4.2 config
-// lands. Aggregate counts only; no agent/pane ids participate.
+// WorkspaceIDKey. The per-workspace datapoints are bounded at
+// 5 x N_workspaces series per machine, and can be turned off via the 4.2
+// HERDR_OBSRVR_EMIT_PER_WORKSPACE_GAUGES config flag (default on — revisit of
+// the plan's original default-off caution; the mission's per-workspace view and
+// the 3.7 gauge depend on the dimension). Aggregate counts only; no
+// agent/pane ids participate.
 const (
 	// ActiveAgentsMetricName is the 3.6 gauge for agents currently working.
 	ActiveAgentsMetricName = "herdr.agent.active"
@@ -125,10 +127,17 @@ const (
 //
 // The exporter reads its whole configuration from the environment
 // (OTEL_EXPORTER_OTLP_ENDPOINT defaulting to https://localhost:4317,
-// OTEL_EXPORTER_OTLP_INSECURE, OTEL_EXPORTER_OTLP_HEADERS, ...), so no
-// endpoint plumbing is needed here. WithInsecure pins the SDK to a plaintext
-// local collector, which is the deployment this plugin targets; promoting TLS
-// to a config flag is deferred to the Phase 4.2 plugin config.
+// OTEL_EXPORTER_OTLP_INSECURE, OTEL_EXPORTER_OTLP_HEADERS, ...), so when no
+// plugin config file is supplied (cfg nil) no endpoint plumbing is needed.
+// With a 4.2 plugin config, only the keys it explicitly sets become exporter
+// options — and an explicit option wins over the env — so the config file is
+// the higher-precedence source for those keys and env still back-fills the
+// gaps. Insecure defaults to true (plaintext local collector); only an
+// explicit OTEL_EXPORTER_OTLP_INSECURE=false in the config file switches to
+// TLS. Note this TLS switch is deliberately config-file-driven, not a bare
+// OTEL_EXPORTER_OTLP_INSECURE shell var: the exporters expose WithInsecure
+// (force plaintext) but no force-TLS option, so a process-env value can't be
+// cleanly layered under a config default (see internal/config).
 //
 // The gRPC connection is established lazily (grpc.NewClient): construction
 // never blocks or fails because the collector is unreachable — individual
@@ -138,8 +147,8 @@ const (
 // The returned func flushes and shuts down the provider. Callers that receive
 // an error (configuration-level failure only) should log and continue without
 // telemetry rather than aborting the process.
-func NewMeterProvider(ctx context.Context, res *resource.Resource) (apimetric.MeterProvider, func(context.Context) error, error) {
-	exporter, err := otlpmetricgrpc.New(ctx, otlpmetricgrpc.WithInsecure())
+func NewMeterProvider(ctx context.Context, res *resource.Resource, cfg ...*config.Config) (apimetric.MeterProvider, func(context.Context) error, error) {
+	exporter, err := otlpmetricgrpc.New(ctx, metricOTLPOptions(firstConfig(cfg))...)
 	if err != nil {
 		return nil, nil, fmt.Errorf("creating OTLP gRPC metrics exporter: %w", err)
 	}
@@ -270,4 +279,29 @@ func NewWorkspaceConcurrentGauge(meter apimetric.Meter) (apimetric.Int64Observab
 		apimetric.WithUnit("1"),
 		apimetric.WithDescription("Number of agents concurrently working per workspace (working + blocked)"),
 	)
+}
+
+// metricOTLPOptions translates a plugin config's OTLP keys into exporter
+// options, passing an option ONLY for keys the config file explicitly set so
+// OTEL_EXPORTER_OTLP_* env vars keep back-filling everything else. With no
+// config (nil) the option list is exactly the hard-coded plaintext pin that
+// predates 4.2 — zero behavior change for existing installs.
+func metricOTLPOptions(c *config.Config) []otlpmetricgrpc.Option {
+	if c == nil {
+		return []otlpmetricgrpc.Option{otlpmetricgrpc.WithInsecure()}
+	}
+	var opts []otlpmetricgrpc.Option
+	if c.OTLP.InsecureDefault() {
+		opts = append(opts, otlpmetricgrpc.WithInsecure())
+	}
+	if c.OTLP.Endpoint != nil {
+		opts = append(opts, otlpmetricgrpc.WithEndpoint(*c.OTLP.Endpoint))
+	}
+	if c.OTLP.Timeout != nil {
+		opts = append(opts, otlpmetricgrpc.WithTimeout(*c.OTLP.Timeout))
+	}
+	if c.OTLP.Headers != nil {
+		opts = append(opts, otlpmetricgrpc.WithHeaders(config.ParseHeaders(*c.OTLP.Headers)))
+	}
+	return opts
 }

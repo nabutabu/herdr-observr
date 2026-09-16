@@ -71,9 +71,36 @@ HERDR_SOCKET_PATH=/path/to/your/herdr.sock ./bin/herdr-observr
 ```
 
 The socket path is read from `HERDR_SOCKET_PATH` and NEEDS to be set in order to
-run correctly (Herdr injects it when the plugin starts the daemon itself). The
-OTLP endpoint comes from `OTEL_EXPORTER_OTLP_ENDPOINT` (defaults to
-collector:4317) and other standard `OTEL_*` env vars.
+run correctly (Herdr injects it when the plugin starts the daemon itself).
+
+## Configuration
+
+herdr-observr reads a `.env` config file from the plugin's config directory
+(`HERDR_PLUGIN_CONFIG_DIR`) — Herdr creates the directory and your user
+editable config lives there. To find it:
+
+```sh
+herdr plugin config-dir nabutabu.herdr-observr
+```
+
+Copy [`example.env`](example.env) into that directory as `.env` and fill in
+what you need. Keys set in the file win over the process environment, which
+falls back to the OTel SDK defaults:
+
+| Key | Default | Purpose |
+| --- | --- | --- |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | `OTEL_EXPORTER_OTLP_ENDPOINT` env / SDK default | Collector base URL (metrics, logs, traces) |
+| `OTEL_EXPORTER_OTLP_INSECURE` | `true` (plaintext) | Set `false` to force TLS — the only supported TLS switch |
+| `OTEL_EXPORTER_OTLP_TIMEOUT` | SDK default | Per-export timeout |
+| `OTEL_EXPORTER_OTLP_HEADERS` | SDK default | Extra gRPC metadata (auth/proxy) |
+| `OTEL_SERVICE_NAME` | `herdr-telemetry` | `service.name` resource attribute |
+| `OTEL_RESOURCE_ATTRIBUTES` | env / empty | Extra resource attributes |
+| `HERDR_OBSRVR_MACHINE_ID` | persisted UUID | Fixed cross-machine identity override |
+| `HERDR_OBSRVR_EMIT_PER_WORKSPACE_GAUGES` | `true` | Set `false` to drop per-workspace gauge series (cardinality opt-out) |
+
+Malformed lines and unknown keys are skipped with a warning — a bad config file
+never stops the daemon (the process degrades to env defaults). Endpoint and the
+default `OTEL_*` env vars still work exactly as before.
 
 ## Release
 
@@ -113,9 +140,11 @@ internal/snapshot/           # session.snapshot fetch/parse
 internal/tracker/            # state machine, duration/attention/concurrency accounting,
                              #   grace-window retention, periodic reconciliation (read-only)
 internal/otel/               # OTLP/gRPC metrics, logs, traces providers + resource builder
+internal/config/             # 4.2: .env parsing (HERDR_PLUGIN_CONFIG_DIR) and typed config
 internal/machineid/          # persisted herdr.machine.id UUID
 internal/version/            # release version (synced by .github/workflows/release.yml)
 deploy/                      # local demo stack: collector, Prometheus, Tempo, Loki, Grafana
+example.env                  # commented sample plugin config ($HERDR_PLUGIN_CONFIG_DIR/.env)
 herdr-plugin.toml            # the Herdr plugin manifest ([[build]] + [[startup]])
 PLAN.md                      # full multi-phase implementation plan
 ```

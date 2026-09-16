@@ -13,6 +13,7 @@ import (
 	"go.opentelemetry.io/otel/sdk/resource"
 	"go.opentelemetry.io/otel/trace"
 
+	"github.com/nabutabu/herdr-observr/internal/config"
 	"github.com/nabutabu/herdr-observr/internal/otel"
 	"github.com/nabutabu/herdr-observr/internal/snapshot"
 	"github.com/nabutabu/herdr-observr/internal/tracker"
@@ -70,23 +71,25 @@ type Telemetry struct {
 	shutdown func(context.Context) error
 }
 
-// NewTelemetry initializes the OTel SDKs from the environment (3.1): the
-// metrics provider (OTEL_EXPORTER_OTLP_ENDPOINT, OTEL_SERVICE_NAME defaulting
-// to herdr-telemetry, OTEL_RESOURCE_ATTRIBUTES) and, for 3.8's structured
-// state-change events and 3.9's state-change spans, the logs and traces
-// providers over the same resource and endpoint. Each exporter dials lazily,
-// so an unreachable collector shows up as dropped exports, not a startup
-// failure (Phase 5.4); the only errors here are configuration-level, and each
-// signal is treated the same way: log and run without that signal. With
-// instruments registered it returns the constructed Telemetry; nil means
-// telemetry is disabled and every record method no-ops.
-func NewTelemetry(ctx context.Context) *Telemetry {
-	res, err := otel.BuildResource(ctx)
+// NewTelemetry initializes the OTel SDKs from the environment (3.1) and an
+// optional 4.2 plugin config file (otp cfg; nil keeps pure env behavior): the
+// metrics provider (endpoint from config-or-OTEL_EXPORTER_OTLP_ENDPOINT,
+// OTEL_SERVICE_NAME defaulting to herdr-telemetry, OTEL_RESOURCE_ATTRIBUTES)
+// and, for 3.8's structured state-change events and 3.9's state-change spans,
+// the logs and traces providers over the same resource and endpoint. Each
+// exporter dials lazily, so an unreachable collector shows up as dropped
+// exports, not a startup failure (Phase 5.4); the only errors here are
+// configuration-level, and each signal is treated the same way: log and run
+// without that signal. With instruments registered it returns the constructed
+// Telemetry; nil means telemetry is disabled and every record method no-ops.
+func NewTelemetry(ctx context.Context, cfg ...*config.Config) *Telemetry {
+	c := firstConfig(cfg)
+	res, err := otel.BuildResource(ctx, c)
 	if err != nil {
 		slog.Warn("OTel resource init failed; telemetry disabled", "error", err)
 		return nil
 	}
-	mp, shutdown, err := otel.NewMeterProvider(ctx, res)
+	mp, shutdown, err := otel.NewMeterProvider(ctx, res, c)
 	if err != nil {
 		slog.Warn("OTel SDK init failed; telemetry disabled", "error", err)
 		return nil
@@ -94,12 +97,20 @@ func NewTelemetry(ctx context.Context) *Telemetry {
 	t := &Telemetry{meter: mp.Meter(otel.MeterName), resource: res, shutdown: shutdown}
 	slog.Info("OTel metrics enabled", "service", otel.ServiceName(res))
 	t.registerUp()
-	t.registerLogger()
-	t.registerTracers()
+	t.registerLogger(c)
+	t.registerTracers(c)
 	t.registerTransitions()
 	t.registerStateDurations()
 	t.registerAttentionLatency()
 	return t
+}
+
+// firstConfig picks the single optional plugin config, or nil.
+func firstConfig(cfg []*config.Config) *config.Config {
+	if len(cfg) == 0 {
+		return nil
+	}
+	return cfg[0]
 }
 
 // Shutdown flushes and closes the providers. Safe on a nil Telemetry and when
@@ -141,14 +152,14 @@ func (t *Telemetry) registerUp() {
 
 // registerLogger initializes the 3.8 logs signal: a LoggerProvider over the
 // same resource as the metrics provider, exporting state-change event records
-// on the OTLP Logs path of the same OTLP endpoint. Initialization failure
-// (e.g. a stale configuration) disables state-change events only, never the
-// subscription.
-func (t *Telemetry) registerLogger() {
+// on the OTLP Logs path of the same OTLP endpoint (config-driven exporter
+// options per 4.2). Initialization failure (e.g. a stale configuration)
+// disables state-change events only, never the subscription.
+func (t *Telemetry) registerLogger(c *config.Config) {
 	if t.meter == nil {
 		return
 	}
-	lp, lshutdown, err := otel.NewLoggerProvider(context.Background(), t.resource)
+	lp, lshutdown, err := otel.NewLoggerProvider(context.Background(), t.resource, c)
 	if err != nil {
 		slog.Warn("OTel logs SDK init failed; state-change events disabled", "error", err)
 		return
@@ -160,14 +171,14 @@ func (t *Telemetry) registerLogger() {
 
 // registerTracers initializes the 3.9 traces signal: a TracerProvider over the
 // same resource as the metrics provider, exporting state-change spans on the
-// OTLP Traces path of the same OTLP endpoint. Initialization failure (e.g. a
-// stale configuration) disables state-change spans only, never the
-// subscription.
-func (t *Telemetry) registerTracers() {
+// OTLP Traces path of the same OTLP endpoint (config-driven exporter options
+// per 4.2). Initialization failure (e.g. a stale configuration) disables
+// state-change spans only, never the subscription.
+func (t *Telemetry) registerTracers(c *config.Config) {
 	if t.meter == nil {
 		return
 	}
-	tp, tshutdown, err := otel.NewTracerProvider(context.Background(), t.resource)
+	tp, tshutdown, err := otel.NewTracerProvider(context.Background(), t.resource, c)
 	if err != nil {
 		slog.Warn("OTel traces SDK init failed; state-change spans disabled", "error", err)
 		return
@@ -331,19 +342,36 @@ func (t *Telemetry) recordAttentionLatency(al tracker.AttentionLatency) {
 // once the tracker exists — unlike the 3.3–3.5 instruments these need a counts
 // source, so registration is not part of NewTelemetry. Registration failure
 // (e.g. a stale meter) disables the gauges, never the subscription.
-func (t *Telemetry) registerCountGauges(counts func() tracker.AgentCounts) {
+//
+// The 4.2 HERDR_OBSRVR_EMIT_PER_WORKSPACE_GAUGES config flag (cfg) gates the
+// per-workspace datapoints: when false, the 3.6 gauges observe only their
+// global datapoint and the 3.7 per-workspace gauge is not registered at all —
+// a cardinality opt-out for backends that cannot take 5 x N_workspaces series
+// per machine. Default (nil cfg or flag unset) is the always-emit behavior
+// with explicit zeros.
+func (t *Telemetry) registerCountGauges(cfg *config.Config, counts func() tracker.AgentCounts) {
 	if t == nil || t.meter == nil {
 		return
 	}
+	emitWs := cfg == nil || cfg.EmitPerWorkspaceGaugesDefault()
+
 	gauges, err := otel.NewAgentCountGauges(t.meter)
 	if err != nil {
 		slog.Warn("registering agent count gauges failed", "error", err)
 		return
 	}
-	concurrent, err := otel.NewWorkspaceConcurrentGauge(t.meter)
-	if err != nil {
-		slog.Warn("registering workspace concurrent gauge failed", "error", err)
-		return
+
+	var concurrent metric.Int64ObservableGauge
+	instruments := []metric.Observable{
+		gauges.Active, gauges.Blocked, gauges.Idle, gauges.Done, gauges.Unknown,
+	}
+	if emitWs {
+		concurrent, err = otel.NewWorkspaceConcurrentGauge(t.meter)
+		if err != nil {
+			slog.Warn("registering workspace concurrent gauge failed", "error", err)
+			return
+		}
+		instruments = append(instruments, concurrent)
 	}
 
 	// stateGauges maps each tracked agent state to its 3.6 gauge; the gauge's
@@ -361,19 +389,22 @@ func (t *Telemetry) registerCountGauges(counts func() tracker.AgentCounts) {
 		{gauges.Unknown, snapshot.AgentStatusUnknown},
 	}
 
-	// One callback serves all six gauges so the tracker's Counts() (deep-copy
-	// snapshot under its own lock) is taken once per collection, not six
-	// times. Each 3.6 gauge observes a global datapoint plus one per workspace
-	// carrying herdr.workspace.id — always emitted (bounded at 5 x N_workspaces
-	// per machine; see NewAgentCountGauges for the config-flag note). Absent
-	// map entries read as zero, so empty states still emit an explicit 0 and
-	// their Prometheus series never go stale. The 3.7 gauge observes only the
-	// per-workspace working+blocked sum (no global point), same always-emitted
-	// workspace dimension and same single Counts() snapshot.
+	// One callback serves all registered gauges so the tracker's Counts()
+	// (deep-copy snapshot under its own lock) is taken once per collection.
+	// Each 3.6 gauge observes a global datapoint plus, when emitWs, one per
+	// workspace carrying herdr.workspace.id — always emitted (bounded at 5 x
+	// N_workspaces per machine; see NewAgentCountGauges for the config-flag
+	// note). Absent map entries read as zero, so empty states still emit an
+	// explicit 0 and their Prometheus series never go stale. The 3.7 gauge
+	// observes only the per-workspace working+blocked sum (no global point),
+	// same always-emitted workspace dimension and same single Counts().
 	_, err = t.meter.RegisterCallback(func(ctx context.Context, o metric.Observer) error {
 		c := counts()
 		for _, sg := range stateGauges {
 			o.ObserveInt64(sg.gauge, int64(c.Global[sg.state]))
+			if !emitWs {
+				continue
+			}
 			// Observe every state for each workspace that has any agents, not
 			// just the states present in its bucket, so per-workspace series
 			// stay present across state changes.
@@ -383,14 +414,16 @@ func (t *Telemetry) registerCountGauges(counts func() tracker.AgentCounts) {
 				)
 			}
 		}
-		for wsID, wsCounts := range c.Workspace {
-			o.ObserveInt64(concurrent,
-				int64(wsCounts[snapshot.AgentStatusWorking])+int64(wsCounts[snapshot.AgentStatusBlocked]),
-				metric.WithAttributes(attribute.String(otel.WorkspaceIDKey, wsID)),
-			)
+		if emitWs {
+			for wsID, wsCounts := range c.Workspace {
+				o.ObserveInt64(concurrent,
+					int64(wsCounts[snapshot.AgentStatusWorking])+int64(wsCounts[snapshot.AgentStatusBlocked]),
+					metric.WithAttributes(attribute.String(otel.WorkspaceIDKey, wsID)),
+				)
+			}
 		}
 		return nil
-	}, gauges.Active, gauges.Blocked, gauges.Idle, gauges.Done, gauges.Unknown, concurrent)
+	}, instruments...)
 	if err != nil {
 		slog.Warn("registering agent count gauge callback failed", "error", err)
 	}
