@@ -103,6 +103,23 @@ const (
 	WorkspaceIDKey = "herdr.workspace.id"
 )
 
+// (3.7) herdr.workspace.agent.concurrent — an observable gauge of the agents
+// concurrently working per workspace, summed over working + blocked (the two
+// states where an agent is engaged in the work cycle: actively producing or
+// waiting on a human). Distinct from the 3.6 gauges, which are per-state; this
+// is the mission's "how much concurrent agent work is happening" per workspace.
+//
+// Per-workspace only — there is no global datapoint, because a concurrency
+// count is meaningless without the workspace it belongs to. One datapoint per
+// workspace carries WorkspaceIDKey, always emitted (explicit 0 when the sum is
+// zero), mirroring the 3.6 gauges' always-emit decision so per-workspace
+// series never go stale. Bounded at N_workspaces series per machine; aggregated
+// counts only, no agent/pane ids participate.
+const (
+	// WorkspaceConcurrentMetricName is the 3.7 gauge metric name.
+	WorkspaceConcurrentMetricName = "herdr.workspace.agent.concurrent"
+)
+
 // NewMeterProvider initializes the OTel metrics SDK with the OTLP/gRPC
 // exporter and associates it with res.
 //
@@ -237,4 +254,20 @@ func NewAgentCountGauges(meter apimetric.Meter) (AgentCountGauges, error) {
 		return AgentCountGauges{}, err
 	}
 	return AgentCountGauges{Active: active, Blocked: blocked, Idle: idle, Done: done, Unknown: unknown}, nil
+}
+
+// NewWorkspaceConcurrentGauge registers herdr.workspace.agent.concurrent (3.7)
+// on meter and returns it, or an error if registration failed. The returned
+// gauge is a no-op when the meter itself is a no-op (telemetry disabled).
+// Created bare — without a collection callback — and registered app-side via
+// meter.RegisterCallback (internal/app/telemetry.go), which maps
+// tracker.AgentCounts onto it in the same snapshot pass as the 3.6 gauges.
+// Counts are observed with unit "1" (number of agents), one datapoint per
+// workspace running on the SDK's collection cadence — no per-event writes.
+func NewWorkspaceConcurrentGauge(meter apimetric.Meter) (apimetric.Int64ObservableGauge, error) {
+	return meter.Int64ObservableGauge(
+		WorkspaceConcurrentMetricName,
+		apimetric.WithUnit("1"),
+		apimetric.WithDescription("Number of agents concurrently working per workspace (working + blocked)"),
+	)
 }

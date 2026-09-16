@@ -504,13 +504,13 @@ func TestRecordAttentionLatencyNoopWithoutTelemetry(t *testing.T) {
 	a.telemetry.recordAttentionLatency(al)
 }
 
-func TestAgentCountGaugesEventDriven(t *testing.T) {
+func TestCountGaugesEventDriven(t *testing.T) {
 	reader := metric.NewManualReader()
 	mp := otel.NewMeterProviderWithReader(reader, resource.NewSchemaless(attribute.String("service.name", "test")))
 	defer func() { _ = mp.Shutdown(context.Background()) }()
 
 	a := &App{telemetry: &Telemetry{meter: mp.Meter(otel.MeterName)}, tr: tracker.NewTracker()}
-	a.telemetry.registerAgentCounts(a.tr.Counts)
+	a.telemetry.registerCountGauges(a.tr.Counts)
 
 	// Drive the tracker through the same handleEvent path as production via
 	// status events spread across two workspaces.
@@ -563,6 +563,16 @@ func TestAgentCountGaugesEventDriven(t *testing.T) {
 		t.Errorf("done per-workspace entries = %d, want 2 (w1, w2)", len(byWs))
 	}
 
+	// (3.7) herdr.workspace.agent.concurrent sums working + blocked per
+	// workspace, one datapoint per workspace and no global point.
+	concurrent := findInt64GaugePoints(t, rm, otel.WorkspaceConcurrentMetricName)
+	if global, byWs = gaugeValues(concurrent); global != 0 {
+		t.Errorf("concurrent global = %d, want 0 (per-workspace metric only)", global)
+	}
+	if byWs[ws1] != 2 || byWs[ws2] != 1 {
+		t.Errorf("concurrent per-workspace = %+v, want w1=2 (working+blocked) w2=1", byWs)
+	}
+
 	// Closing a pane decrements its workspace and global counts immediately
 	// (2.7), reflected on the next collection — no per-event gauge writes.
 	a.handleEvent(events.NormalizedEvent{Kind: events.KindPaneClosed, PaneID: "w1:p1"})
@@ -577,13 +587,32 @@ func TestAgentCountGaugesEventDriven(t *testing.T) {
 	if byWs[ws1] != 0 || byWs[ws2] != 1 {
 		t.Errorf("active per-workspace after close = %+v, want w1=0 w2=1", byWs)
 	}
+	concurrent = findInt64GaugePoints(t, rm, otel.WorkspaceConcurrentMetricName)
+	global, byWs = gaugeValues(concurrent)
+	if byWs[ws1] != 1 || byWs[ws2] != 1 {
+		t.Errorf("concurrent per-workspace after close = %+v, want w1=1 w2=1", byWs)
+	}
+
+	// A workspace whose agents are all non-concurrent still emits an explicit
+	// 0 (3.7 mirrors the 3.6 always-emit decision) until work resumes.
+	a.handleEvent(status(snapshot.AgentStatusIdle, "w2:p1", ws2)) // w2:p1 working -> idle
+	if err := reader.Collect(context.Background(), &rm); err != nil {
+		t.Fatalf("collect after idle: %v", err)
+	}
+	concurrent = findInt64GaugePoints(t, rm, otel.WorkspaceConcurrentMetricName)
+	if global, byWs = gaugeValues(concurrent); global != 0 {
+		t.Errorf("concurrent global after idle = %d, want 0", global)
+	}
+	if byWs[ws1] != 1 || byWs[ws2] != 0 {
+		t.Errorf("concurrent per-workspace after idle = %+v, want w1=1 w2=0 (explicit zero)", byWs)
+	}
 }
 
-func TestAgentCountGaugesNoopWithoutTelemetry(t *testing.T) {
+func TestCountGaugesNoopWithoutTelemetry(t *testing.T) {
 	// Telemetry disabled (nil meter): registering the gauges must be a no-op,
 	// never a panic or block.
 	a := &App{tr: tracker.NewTracker()}
-	a.telemetry.registerAgentCounts(a.tr.Counts)
+	a.telemetry.registerCountGauges(a.tr.Counts)
 	a.tr.ApplyAgentStatusChanged(events.NormalizedEvent{Kind: events.KindAgentStatusChanged, PaneID: "w1:p1", WorkspaceID: "w1", Agent: "codex", NewState: snapshot.AgentStatusWorking})
 }
 

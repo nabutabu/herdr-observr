@@ -193,19 +193,24 @@ func (t *Telemetry) recordAttentionLatency(al tracker.AttentionLatency) {
 	)
 }
 
-// registerAgentCounts registers the 3.6 herdr.agent.{active,blocked,idle,done,
-// unknown} gauges and wires them to the tracker's live concurrency counts
-// (2.6). Called from App.Run once the tracker exists — unlike the 3.3–3.5
-// instruments it needs a counts source, so it is not part of NewTelemetry.
-// Registration failure (e.g. a stale meter) disables the gauges, never the
-// subscription.
-func (t *Telemetry) registerAgentCounts(counts func() tracker.AgentCounts) {
+// registerCountGauges registers the 3.6 herdr.agent.{active,blocked,idle,done,
+// unknown} gauges and the 3.7 herdr.workspace.agent.concurrent gauge, and wires
+// them to the tracker's live concurrency counts (2.6). Called from App.Run
+// once the tracker exists — unlike the 3.3–3.5 instruments these need a counts
+// source, so registration is not part of NewTelemetry. Registration failure
+// (e.g. a stale meter) disables the gauges, never the subscription.
+func (t *Telemetry) registerCountGauges(counts func() tracker.AgentCounts) {
 	if t == nil || t.meter == nil {
 		return
 	}
 	gauges, err := otel.NewAgentCountGauges(t.meter)
 	if err != nil {
 		slog.Warn("registering agent count gauges failed", "error", err)
+		return
+	}
+	concurrent, err := otel.NewWorkspaceConcurrentGauge(t.meter)
+	if err != nil {
+		slog.Warn("registering workspace concurrent gauge failed", "error", err)
 		return
 	}
 
@@ -224,13 +229,15 @@ func (t *Telemetry) registerAgentCounts(counts func() tracker.AgentCounts) {
 		{gauges.Unknown, snapshot.AgentStatusUnknown},
 	}
 
-	// One callback serves all five gauges so the tracker's Counts() (deep-copy
-	// snapshot under its own lock) is taken once per collection, not five
-	// times. Each gauge observes a global datapoint plus one per workspace
+	// One callback serves all six gauges so the tracker's Counts() (deep-copy
+	// snapshot under its own lock) is taken once per collection, not six
+	// times. Each 3.6 gauge observes a global datapoint plus one per workspace
 	// carrying herdr.workspace.id — always emitted (bounded at 5 x N_workspaces
 	// per machine; see NewAgentCountGauges for the config-flag note). Absent
 	// map entries read as zero, so empty states still emit an explicit 0 and
-	// their Prometheus series never go stale.
+	// their Prometheus series never go stale. The 3.7 gauge observes only the
+	// per-workspace working+blocked sum (no global point), same always-emitted
+	// workspace dimension and same single Counts() snapshot.
 	_, err = t.meter.RegisterCallback(func(ctx context.Context, o metric.Observer) error {
 		c := counts()
 		for _, sg := range stateGauges {
@@ -244,8 +251,14 @@ func (t *Telemetry) registerAgentCounts(counts func() tracker.AgentCounts) {
 				)
 			}
 		}
+		for wsID, wsCounts := range c.Workspace {
+			o.ObserveInt64(concurrent,
+				int64(wsCounts[snapshot.AgentStatusWorking])+int64(wsCounts[snapshot.AgentStatusBlocked]),
+				metric.WithAttributes(attribute.String(otel.WorkspaceIDKey, wsID)),
+			)
+		}
 		return nil
-	}, gauges.Active, gauges.Blocked, gauges.Idle, gauges.Done, gauges.Unknown)
+	}, gauges.Active, gauges.Blocked, gauges.Idle, gauges.Done, gauges.Unknown, concurrent)
 	if err != nil {
 		slog.Warn("registering agent count gauge callback failed", "error", err)
 	}

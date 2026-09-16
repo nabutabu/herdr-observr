@@ -272,6 +272,81 @@ func TestAgentCountGaugesRegisterAndObserve(t *testing.T) {
 	}
 }
 
+func TestWorkspaceConcurrentGaugeRegistersAndObserves(t *testing.T) {
+	// (3.7) Pin the workspace-concurrent gauge metric name, its unit, and the
+	// int64 observable-gauge behavior. A callback observes explicitly (values
+	// include a zero) to prove presence and shape; the app-layer test drives
+	// real tracker working+blocked sums through it.
+	setCleanEnv(t)
+
+	res, err := BuildResource(context.Background())
+	if err != nil {
+		t.Fatalf("BuildResource: %v", err)
+	}
+
+	reader := metric.NewManualReader()
+	mp := newMeterProviderWithReader(reader, res)
+	defer func() { _ = mp.Shutdown(context.Background()) }()
+
+	gauge, err := NewWorkspaceConcurrentGauge(mp.Meter(MeterName))
+	if err != nil {
+		t.Fatalf("NewWorkspaceConcurrentGauge: %v", err)
+	}
+
+	_, err = mp.Meter(MeterName).RegisterCallback(func(_ context.Context, o otmetric.Observer) error {
+		o.ObserveInt64(gauge, 2,
+			otmetric.WithAttributes(attribute.String(WorkspaceIDKey, "w1")),
+		)
+		o.ObserveInt64(gauge, 0,
+			otmetric.WithAttributes(attribute.String(WorkspaceIDKey, "w2")),
+		)
+		return nil
+	}, gauge)
+	if err != nil {
+		t.Fatalf("RegisterCallback: %v", err)
+	}
+
+	var rm metricdata.ResourceMetrics
+	if err := reader.Collect(context.Background(), &rm); err != nil {
+		t.Fatalf("collect: %v", err)
+	}
+
+	found := false
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			if m.Name != WorkspaceConcurrentMetricName {
+				continue
+			}
+			found = true
+			if m.Unit != "1" {
+				t.Errorf("unit = %q, want %q", m.Unit, "1")
+			}
+			g, ok := m.Data.(metricdata.Gauge[int64])
+			if !ok {
+				t.Fatalf("data type = %T, want Gauge[int64]", m.Data)
+			}
+			if len(g.DataPoints) != 2 {
+				t.Fatalf("datapoints = %d, want 2 (one per workspace)", len(g.DataPoints))
+			}
+			byWs := map[string]int64{}
+			for _, dp := range g.DataPoints {
+				ws, ok := dp.Attributes.Value(attribute.Key(WorkspaceIDKey))
+				if !ok {
+					t.Errorf("datapoint missing %q attribute", WorkspaceIDKey)
+					continue
+				}
+				byWs[ws.AsString()] = dp.Value
+			}
+			if byWs["w1"] != 2 || byWs["w2"] != 0 {
+				t.Errorf("datapoints = %+v, want w1=2 w2=0 (explicit zero)", g.DataPoints)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("metric %q not found in collected data", WorkspaceConcurrentMetricName)
+	}
+}
+
 func TestNewMeterProviderWithUnreachableEndpoint(t *testing.T) {
 	// The gRPC connection is established lazily, so construction must succeed
 	// even when the collector is unreachable (Phase 5.4): exports fail and are
