@@ -1,0 +1,181 @@
+{
+  "uid": "herdr-scribe",
+  "title": "herdr-scribe — agent health",
+  "tags": ["herdr", "otel"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": true,
+  "refresh": "10s",
+  "time": { "from": "now-15m", "to": "now" },
+  "templating": {
+    "list": [
+      {
+        "name": "datasource",
+        "type": "datasource",
+        "query": "prometheus",
+        "label": "Data source",
+        "hide": 0
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "timeseries",
+      "title": "Agent count by state",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "fieldConfig": {
+        "defaults": { "unit": "short", "min": 0, "custom": { "drawStyle": "lines", "fillOpacity": 10, "stacking": { "mode": "none" } } }
+      },
+      "targets": [
+        { "refId": "A", "expr": "herdr_agent_active_ratio{herdr_workspace_id=\"\"}", "legendFormat": "working" },
+        { "refId": "B", "expr": "herdr_agent_blocked_ratio{herdr_workspace_id=\"\"}", "legendFormat": "blocked" },
+        { "refId": "C", "expr": "herdr_agent_idle_ratio{herdr_workspace_id=\"\"}", "legendFormat": "idle" },
+        { "refId": "D", "expr": "herdr_agent_done_ratio{herdr_workspace_id=\"\"}", "legendFormat": "done" },
+        { "refId": "E", "expr": "herdr_agent_unknown_ratio{herdr_workspace_id=\"\"}", "legendFormat": "unknown" }
+      ]
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "Concurrent agents per workspace",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "fieldConfig": {
+        "defaults": { "unit": "short", "min": 0, "custom": { "drawStyle": "lines", "fillOpacity": 20 } }
+      },
+      "targets": [
+        { "refId": "A", "expr": "herdr_workspace_agent_concurrent_ratio", "legendFormat": "{{herdr_workspace_id}}" }
+      ]
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "State transition rate",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "fieldConfig": {
+        "defaults": { "unit": "ops", "custom": { "drawStyle": "bars", "fillOpacity": 100 } }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(herdr_agent_state_transitions_total[$__rate_interval])) by (herdr_agent_previous_state, herdr_agent_state)",
+          "legendFormat": "{{herdr_agent_previous_state}} → {{herdr_agent_state}}"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "State duration percentiles",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "fieldConfig": {
+        "defaults": { "unit": "s", "custom": { "drawStyle": "lines", "fillOpacity": 10 } }
+      },
+      "targets": [
+        {
+          "refId": "p50",
+          "expr": "histogram_quantile(0.50, sum(rate(herdr_agent_state_duration_seconds_bucket[$__rate_interval])) by (le, herdr_agent_state))",
+          "legendFormat": "p50 {{herdr_agent_state}}"
+        },
+        {
+          "refId": "p95",
+          "expr": "histogram_quantile(0.95, sum(rate(herdr_agent_state_duration_seconds_bucket[$__rate_interval])) by (le, herdr_agent_state))",
+          "legendFormat": "p95 {{herdr_agent_state}}"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "Attention latency (time spent done, awaiting a human)",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
+      "fieldConfig": {
+        "defaults": { "unit": "s", "custom": { "drawStyle": "lines", "fillOpacity": 10 } }
+      },
+      "targets": [
+        {
+          "refId": "p50",
+          "expr": "histogram_quantile(0.50, sum(rate(herdr_agent_attention_latency_seconds_bucket[$__rate_interval])) by (le))",
+          "legendFormat": "p50"
+        },
+        {
+          "refId": "p95",
+          "expr": "histogram_quantile(0.95, sum(rate(herdr_agent_attention_latency_seconds_bucket[$__rate_interval])) by (le))",
+          "legendFormat": "p95"
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "type": "stat",
+      "title": "herdr-scribe up",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 4, "x": 12, "y": 16 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": { "mode": "absolute", "steps": [ { "color": "red", "value": null }, { "color": "green", "value": 1 } ] }
+        }
+      },
+      "targets": [ { "refId": "A", "expr": "herdr_up" } ]
+    },
+    {
+      "id": 7,
+      "type": "stat",
+      "title": "Total state transitions",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 4, "x": 16, "y": 16 },
+      "fieldConfig": { "defaults": { "unit": "short" } },
+      "targets": [ { "refId": "A", "expr": "sum(herdr_agent_state_transitions_total)" } ]
+    },
+    {
+      "id": 8,
+      "type": "stat",
+      "title": "Concurrent now (all workspaces)",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 4, "x": 20, "y": 16 },
+      "fieldConfig": { "defaults": { "unit": "short" } },
+      "targets": [ { "refId": "A", "expr": "sum(herdr_workspace_agent_concurrent_ratio)" } ]
+    },
+    {
+      "id": 9,
+      "type": "logs",
+      "title": "herdr.agent.state_change events",
+      "datasource": { "type": "loki", "uid": "loki" },
+      "gridPos": { "h": 10, "w": 12, "x": 0, "y": 24 },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "loki", "uid": "loki" },
+          "expr": "{service_name=\"herdr-telemetry\"}"
+        }
+      ],
+      "options": {
+        "showTime": true,
+        "showLabels": true,
+        "showCommonLabels": false
+      }
+    },
+    {
+      "id": 10,
+      "type": "traces",
+      "title": "Agent state-change traces",
+      "datasource": { "type": "tempo", "uid": "tempo" },
+      "gridPos": { "h": 10, "w": 12, "x": 12, "y": 24 },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "tempo", "uid": "tempo" },
+          "queryType": "traceql",
+          "query": "{resource.service.name=\"herdr-telemetry\"}"
+        }
+      ]
+    }
+  ]
+}

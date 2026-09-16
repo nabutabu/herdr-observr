@@ -1,0 +1,75 @@
+services:
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.130.0
+    container_name: herdr-otel-collector
+    command: ["--config", "/etc/otelcol/config.yaml"]
+    ports:
+      - "4317:4317"
+      - "8889:8889"
+    volumes:
+      - ./collector.yaml:/etc/otelcol/config.yaml:ro
+    networks:
+      - herdr-demo
+
+  prometheus:
+    image: prom/prometheus:v3.5.0
+    container_name: herdr-prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yaml
+      - --web.enable-lifecycle
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yaml:/etc/prometheus/prometheus.yaml:ro
+    depends_on:
+      - otel-collector
+    networks:
+      - herdr-demo
+
+  loki:
+    image: grafana/loki:3.6.0
+    container_name: herdr-loki
+    user: "0"
+    command: -config.file=/etc/loki/loki.yaml
+    ports:
+      - "3100:3100"
+    volumes:
+      - ./loki.yaml:/etc/loki/loki.yaml:ro
+    networks:
+      - herdr-demo
+
+  tempo:
+    image: grafana/tempo:3.0.0
+    container_name: herdr-tempo
+    command: -config.file=/etc/tempo.yaml
+    ports:
+      - "3200:3200"
+    volumes:
+      - ./tempo.yaml:/etc/tempo.yaml:ro
+    networks:
+      - herdr-demo
+
+  grafana:
+    image: grafana/grafana:12.0.4
+    container_name: herdr-grafana
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+    depends_on:
+      - prometheus
+      - loki
+      - tempo
+    networks:
+      - herdr-demo
+
+networks:
+  herdr-demo:
+    name: herdr-demo

@@ -1,0 +1,19 @@
+apiVersion: 1
+
+datasources:
+  - name: Tempo
+    uid: tempo
+    type: tempo
+    access: proxy
+    url: http://tempo:3200
+    jsonData:
+      httpMethod: GET
+      serviceMap:
+        datasourceUid: prometheus
+      tracesToLogs:
+        datasourceUid: loki
+        filterByTraceID: false
+        tags: [herdr.agent.id, herdr.agent.type, herdr.agent.state, herdr.agent.previous_state, herdr.workspace.id]
+      spanBar:
+        type: "tag"
+        tag: "herdr.agent.state"
