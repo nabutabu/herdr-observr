@@ -1,0 +1,33 @@
+#
+# herdr-plugin.toml registers herdr-observr with herdr as a first-class plugin.
+# Install it with `herdr plugin install nabutabu/herdr-observr` (herdr clones this
+# repo, runs the [[build]] step below, and registers the startup hook), or for
+# local development `herdr plugin link .` from a checkout, then `herdr plugin enable`.
+#
+# This is a telemetry daemon plugin: it subscribes to herdr's live event stream
+# and exports agent runtime health telemetry over OTLP. It never transmits what
+# agents are doing — only lifecycle/state metadata (see AGENTS.md).
+
+id = "nabutabu.herdr-observr"
+name = "Herdr Observr"
+# Kept in sync with internal/version/version.go by .github/workflows/release.yml.
+version = "0.0.3"
+description = "Observe all agents running on herdr through OTLP"
+min_herdr_version = "0.7.5"
+platforms = ["linux", "macos"]
+
+# Produce the daemon at install time. herdr runs this once after a GitHub
+# install, in the plugin root, with no plugin context and no guaranteed Go
+# toolchain. The script prefers a local Go toolchain (an exact build of the
+# cloned source) and falls back to downloading the latest prebuilt release
+# binary, so installing works with or without Go. The result is ./bin/herdr-observr.
+[[build]]
+command = ["sh", "scripts/build.sh"]
+
+# The telemetry daemon. herdr starts it once when the server restores its session
+# and the API socket is ready; it stays running for the life of the boot. A crash
+# is not respawned within a boot (AGENTS.md finding #1), so the binary itself must
+# be resilient — the planned Phase 1.2 supervisor will eventually take over this
+# entrypoint.
+[[startup]]
+command = ["./bin/herdr-observr"]

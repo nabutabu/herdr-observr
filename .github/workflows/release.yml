@@ -1,0 +1,142 @@
+# Release pipeline for herdr-observr. Triggers on every push to main:
+#
+#   1. Determines the next version. If the pushed commit hand-edited
+#      internal/version/version.go (a manual major/minor bump), the workflow
+#      uses that version as-is. Otherwise it auto-bumps the patch number.
+#      Either way it syncs that version into BOTH version.go and
+#      herdr-plugin.toml's `version` field, commits with [skip ci], and pushes.
+#   2. Tags v<x.y.z> and pushes the tag.
+#   3. Runs goreleaser to cross-compile binaries (linux/darwin x amd64/arm64),
+#      package them, attach them to a GitHub Release, and push an updated
+#      Homebrew formula into Formula/ in this same repo (using the default
+#      GITHUB_TOKEN — no separate tap repo or PAT required).
+
+name: Release
+
+on:
+  push:
+    branches: [main]
+    # Docs/deploy-only changes must NOT cut a new binary release. paths-ignore
+    # skips this workflow only when *every* changed file matches, so a mixed
+    # code+docs commit still releases.
+    paths-ignore:
+      - "deploy/**"
+      - "*.md"
+      - "image.png"
+  # Manual escape hatch. If a merge commit accidentally carries a skip-CI
+  # marker (or anything else suppresses the auto-trigger), we can rerun the
+  # release flow against the current main without an empty no-op commit.
+  workflow_dispatch:
+
+# Pushing the version bump and the brew formula back to main needs write access
+# to the repo's contents.
+permissions:
+  contents: write
+
+# Serialise releases — no two version bumps racing each other.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # Full history so the workflow can inspect HEAD~1 for the "did this
+          # commit hand-edit version.go?" check, and so goreleaser sees prior
+          # tags for changelog generation.
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: stable
+
+      # Set the git identity once for the whole job. Both the version-bump
+      # commit and the annotated release tag need it, and the bump step is
+      # skipped on a hand-edited (non-auto-bumped) release — so configuring it
+      # here keeps tagging working on every path.
+      - name: Configure git identity
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      # Decide whether to auto-bump or accept a hand-edited version.
+      - name: Determine version
+        id: version
+        run: |
+          set -euo pipefail
+
+          CURRENT=$(sed -nE 's/.*const Version = "([0-9]+\.[0-9]+\.[0-9]+)".*/\1/p' internal/version/version.go)
+          if [[ -z "$CURRENT" ]]; then
+            echo "Could not parse version from internal/version/version.go" >&2
+            exit 1
+          fi
+
+          # If the pushed commit changed version.go, treat that as a manual
+          # major/minor bump and use the value as-is. Otherwise auto-bump patch.
+          if git diff --name-only HEAD~1..HEAD 2>/dev/null | grep -qx 'internal/version/version.go'; then
+            echo "Version was manually edited to $CURRENT — using as-is."
+            echo "version=$CURRENT"  >> "$GITHUB_OUTPUT"
+            echo "bumped=false"      >> "$GITHUB_OUTPUT"
+          else
+            MAJOR=$(echo "$CURRENT" | cut -d. -f1)
+            MINOR=$(echo "$CURRENT" | cut -d. -f2)
+            PATCH=$(echo "$CURRENT" | cut -d. -f3)
+            NEW="${MAJOR}.${MINOR}.$((PATCH + 1))"
+            echo "Auto-bumping $CURRENT → $NEW"
+            echo "version=$NEW" >> "$GITHUB_OUTPUT"
+            echo "bumped=true"  >> "$GITHUB_OUTPUT"
+          fi
+
+      # Sync the release version into BOTH files that carry it and commit if
+      # anything changed:
+      #   - internal/version/version.go (printed by `herdr-observr version`)
+      #   - herdr-plugin.toml's `version` field (what herdr shows in the plugin
+      #     install preview and `herdr plugin list`)
+      # This runs on both paths — the auto-bump (version.go was the old value)
+      # and a hand-edited version (version.go already new, but the manifest may
+      # still be stale). The diff guard makes it a no-op when both already
+      # match. The [skip ci] marker stops the push from re-triggering.
+      - name: Sync version into version.go + manifest
+        run: |
+          set -euo pipefail
+          NEW="${{ steps.version.outputs.version }}"
+
+          sed -i -E "s/(const Version = )\"[0-9]+\.[0-9]+\.[0-9]+\"/\1\"$NEW\"/" internal/version/version.go
+          sed -i -E "s/^(version = )\"[0-9]+\.[0-9]+\.[0-9]+\"/\1\"$NEW\"/" herdr-plugin.toml
+
+          if git diff --quiet internal/version/version.go herdr-plugin.toml; then
+            echo "version.go and herdr-plugin.toml already at v$NEW — nothing to commit."
+          else
+            git add internal/version/version.go herdr-plugin.toml
+            git commit -m "Release v$NEW [skip ci]"
+            git push origin HEAD:main
+          fi
+
+      # Always create + push the tag (even when version was hand-edited — that's
+      # the whole point of accepting it as-is).
+      - name: Tag release
+        run: |
+          set -euo pipefail
+          NEW="${{ steps.version.outputs.version }}"
+          if git rev-parse -q --verify "refs/tags/v$NEW" >/dev/null; then
+            echo "Tag v$NEW already exists, skipping."
+            exit 0
+          fi
+          git tag -a "v$NEW" -m "Release v$NEW"
+          git push origin "v$NEW"
+
+      - name: Run GoReleaser
+        uses: goreleaser/goreleaser-action@v6
+        with:
+          version: latest
+          args: release --clean
+        env:
+          # Same-repo brew formula push uses the default workflow token — no
+          # separate tap repo or PAT needed.
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -50,7 +50,7 @@ services:
       - herdr-demo
 
   grafana:
-    image: grafana/grafana:12.0.4
+    image: grafana/grafana:12.4.10
     container_name: herdr-grafana
     environment:
       GF_SECURITY_ADMIN_USER: admin

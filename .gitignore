@@ -1,0 +1,10 @@
+# Build artifacts
+bin/
+dist/
+
+# Stale root-level binary (use ./bin/herdr-observr)
+/herdr-observr
+
+# Coverage output
+coverage.out
+coverage.html
