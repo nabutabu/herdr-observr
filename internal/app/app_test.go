@@ -4,6 +4,7 @@ import (
 	"context"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/nabutabu/herdr-scribe/internal/events"
 	"github.com/nabutabu/herdr-scribe/internal/otel"
@@ -14,6 +15,7 @@ import (
 	"go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 	"go.opentelemetry.io/otel/sdk/resource"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 )
 
 func TestPaneCreatedNeedsResubscribe(t *testing.T) {
@@ -95,12 +97,15 @@ func TestNewTelemetryRegistersUpGauge(t *testing.T) {
 	if telemetry.shutdown == nil {
 		t.Fatal("NewTelemetry did not install the shutdown func")
 	}
+	if telemetry.tracer == nil || telemetry.tracerShutdown == nil {
+		t.Fatal("NewTelemetry did not wire the 3.9 trace provider")
+	}
 	telemetry.Shutdown(context.Background())
 }
 
 // drainTransitions replicates Run's select-case consumer, forwarding each
-// transition to the counter and the 3.8 event logger exactly as production
-// does.
+// transition to the counter, the 3.8 event logger, and the 3.9 span tracer
+// exactly as production does.
 func drainTransitions(t *testing.T, a *App) {
 	t.Helper()
 	for {
@@ -108,6 +113,7 @@ func drainTransitions(t *testing.T, a *App) {
 		case tr := <-a.tr.Transitions():
 			a.telemetry.recordTransition(tr)
 			a.telemetry.recordTransitionEvent(tr)
+			a.telemetry.recordTransitionSpan(tr)
 		default:
 			return
 		}
@@ -189,6 +195,51 @@ func logRecordAttrs(t *testing.T, rec sdklog.Record) map[string]string {
 		m[string(kv.Key)] = kv.Value.AsString()
 		return true
 	})
+	return m
+}
+
+// captureSpanExporter is a minimal sdktrace.SpanExporter that snapshots emitted
+// transition spans for assertion, wired synchronously through a
+// SimpleSpanProcessor so spans are captured at End time.
+type captureSpanExporter struct {
+	mu    sync.Mutex
+	spans []sdktrace.ReadOnlySpan
+}
+
+func (c *captureSpanExporter) ExportSpans(_ context.Context, spans []sdktrace.ReadOnlySpan) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.spans = append(c.spans, spans...)
+	return nil
+}
+
+func (c *captureSpanExporter) Shutdown(context.Context) error { return nil }
+
+func (c *captureSpanExporter) snapshot() []sdktrace.ReadOnlySpan {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := make([]sdktrace.ReadOnlySpan, len(c.spans))
+	copy(out, c.spans)
+	return out
+}
+
+// telemetryWithTracer builds a Telemetry whose 3.9 span tracer is wired to a
+// synchronous capture exporter, the traces analogue of the manual-reader seam
+// the metric tests use.
+func telemetryWithTracer(t *testing.T) (*Telemetry, *captureSpanExporter) {
+	t.Helper()
+	capt := &captureSpanExporter{}
+	tp := otel.NewTracerProviderWithProcessor(sdktrace.NewSimpleSpanProcessor(capt), resource.NewSchemaless(attribute.String("service.name", "test")))
+	t.Cleanup(func() { _ = tp.Shutdown(context.Background()) })
+	return &Telemetry{tracer: tp.Tracer(otel.TracerName)}, capt
+}
+
+// spanAttributeMap flattens a captured span's attributes by key.
+func spanAttributeMap(s sdktrace.ReadOnlySpan) map[string]string {
+	m := map[string]string{}
+	for _, kv := range s.Attributes() {
+		m[string(kv.Key)] = kv.Value.AsString()
+	}
 	return m
 }
 
@@ -432,6 +483,88 @@ func TestRecordTransitionEventNoopWithoutTelemetry(t *testing.T) {
 	select {
 	case trns := <-tr.Transitions():
 		a.telemetry.recordTransitionEvent(trns)
+	default:
+		t.Fatal("expected a transition from the tracker")
+	}
+}
+
+func TestRecordTransitionSpanEventDriven(t *testing.T) {
+	// 3.9: a genuine event-driven transition emits one short
+	// herdr.agent.state_change root span carrying the high-cardinality ids the
+	// 3.3 counter excludes, ended immediately at the observed transition — the
+	// "never open-ended" exit criterion.
+	telemetry, capt := telemetryWithTracer(t)
+	a := &App{telemetry: telemetry, tr: tracker.NewTracker()}
+
+	a.handleEvent(statusEv(snapshot.AgentStatusWorking)) // first-seen: no transition
+	a.handleEvent(statusEv(snapshot.AgentStatusBlocked)) // working→blocked
+	drainTransitions(t, a)
+
+	got := capt.snapshot()
+	if len(got) != 1 {
+		t.Fatalf("spans = %d, want 1 (first-seen emits none)", len(got))
+	}
+	s := got[0]
+	if s.Name() != otel.StateChangeEventName {
+		t.Errorf("span name = %q, want %q", s.Name(), otel.StateChangeEventName)
+	}
+	if s.Parent().IsValid() {
+		t.Error("transition span has a parent; 3.9 spans must be root spans")
+	}
+	if s.EndTime().IsZero() {
+		t.Error("span end time is zero; transition spans must end, never stay open")
+	}
+	if d := s.EndTime().Sub(s.StartTime()); d < 0 || d > time.Second {
+		t.Errorf("span duration = %v, want short (>= 0 and < 1s)", d)
+	}
+	attrs := spanAttributeMap(s)
+	for key, want := range map[string]string{
+		otel.AgentIDKey:         "w1:p1",
+		otel.AgentTypeKey:       "codex",
+		otel.WorkspaceIDKey:     "w1",
+		otel.AgentPreviousState: "working",
+		otel.AgentStateKey:      "blocked",
+	} {
+		if got := attrs[key]; got != want {
+			t.Errorf("attribute %q = %q, want %q", key, got, want)
+		}
+	}
+	if attrs["herdr.state.source"] != "" {
+		t.Errorf("herdr.state.source present = %q; verified-absent from pushed status events (finding #3)", attrs["herdr.state.source"])
+	}
+}
+
+func TestRecordTransitionSpanSeenFlip(t *testing.T) {
+	// The silent reconcile-detected close path (2.4): done is flip-flopped to
+	// idle by ApplySeenFlip, exactly as onReport does in production — that is
+	// still a genuine transition and must emit a span too.
+	telemetry, capt := telemetryWithTracer(t)
+	a := &App{telemetry: telemetry, tr: tracker.NewTracker()}
+
+	a.handleEvent(statusEv(snapshot.AgentStatusDone))
+	a.tr.ApplySeenFlip("w1:p1")
+	drainTransitions(t, a)
+
+	got := capt.snapshot()
+	if len(got) != 1 {
+		t.Fatalf("spans = %d, want 1", len(got))
+	}
+	attrs := spanAttributeMap(got[0])
+	if attrs[otel.AgentPreviousState] != "done" || attrs[otel.AgentStateKey] != "idle" {
+		t.Errorf("seen-flip span attrs = %v, want previous=done state=idle", attrs)
+	}
+}
+
+func TestRecordTransitionSpanNoopWithoutTelemetry(t *testing.T) {
+	// Telemetry disabled (nil tracer): emitting spans must be a no-op, never a
+	// panic or block.
+	a := &App{tr: tracker.NewTracker()}
+	tr := tracker.NewTracker()
+	tr.ApplyAgentStatusChanged(statusEv(snapshot.AgentStatusWorking))
+	tr.ApplyAgentStatusChanged(statusEv(snapshot.AgentStatusBlocked))
+	select {
+	case trns := <-tr.Transitions():
+		a.telemetry.recordTransitionSpan(trns)
 	default:
 		t.Fatal("expected a transition from the tracker")
 	}

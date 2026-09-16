@@ -197,6 +197,8 @@ internal/otel/
                                 #   MeterName/UpMetricName consts (herdr.up proof gauge)
   log.go                       # NewLoggerProvider: OTLP/gRPC logs exporter + batch processor (3.8),
                                 #   StateChangeEventName/Body + AgentIDKey consts
+  trace.go                     # NewTracerProvider: OTLP/gRPC traces exporter + batch span processor
+                                #   (3.9), TracerName const; short root herdr.agent.state_change spans
 internal/tracker/
   tracker.go                   # Tracker: mutex-guarded workspaces/tabs/panes/agents maps.
                                 #   Per-kind ApplyWorkspaceCreated/.../ApplyAgentStatusChanged/
@@ -407,12 +409,15 @@ list:
   *within* a running process — it does not protect against the process
   itself crashing (finding #1). This is the top open item.
 - **Phase 3 (OTel/OTLP export)** — 3.1, 3.2 (resource attributes), **3.3**,
-  **3.4**, **3.5**, **3.6**/**3.7**, and **3.8** landed (see above);
-  **3.9 not implemented** — of the three planned signals
-  (counter/histogram/gauges counts above, plus 3.3–3.8), only the short
-  `herdr.agent.state_change` *spans* (3.9) remain. They will share the same
-  `Transitions()` feed and event name as 3.8 and need a trace SDK + OTLP trace
-  exporter, neither of which is in go.mod yet.
+  **3.4**, **3.5**, **3.6**/**3.7**, **3.8**, and **3.9** all landed (see
+  above). 3.9 (short `herdr.agent.state_change` root spans over the OTLP
+  Traces signal, started at the transition's observed time and ended
+  immediately) shares the `Transitions()` feed and `StateChangeEventName`
+  with 3.8, emitting through `internal/otel/trace.go`'s
+  `NewTracerProvider` (lazy-dial OTLP/gRPC trace exporter + batch span
+  processor) into `Telemetry.recordTransitionSpan`. One note: `sdk/trace`
+  ships inside the already-required `go.opentelemetry.io/otel/sdk` module —
+  only the `otlptracegrpc` exporter package was added to go.mod.
 - **Phase 4 (plugin packaging)** — no `herdr-plugin.toml` in the repo.
 - **Phases 5–6** — reliability hardening and the local demo stack.
 

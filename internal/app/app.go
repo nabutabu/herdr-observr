@@ -137,10 +137,12 @@ func (a *App) Run(ctx context.Context) error {
 		case tr := <-a.tr.Transitions():
 			// 3.3: every genuine agent state transition increments the
 			// herdr.agent.state.transitions counter; 3.8 additionally emits a
-			// herdr.agent.state_change event record carrying the
+			// herdr.agent.state_change event record and 3.9 a short
+			// herdr.agent.state_change span, both carrying the
 			// high-cardinality ids the counter excludes.
 			a.telemetry.recordTransition(tr)
 			a.telemetry.recordTransitionEvent(tr)
+			a.telemetry.recordTransitionSpan(tr)
 			slog.Debug("agent state change", "pane_id", tr.PaneID, "agent", tr.Agent, "previous", tr.Previous, "new", tr.New)
 
 		case sd := <-a.tr.StateDurations():

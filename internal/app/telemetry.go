@@ -11,6 +11,7 @@ import (
 	"go.opentelemetry.io/otel/log"
 	"go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/sdk/resource"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/nabutabu/herdr-scribe/internal/otel"
 	"github.com/nabutabu/herdr-scribe/internal/snapshot"
@@ -55,6 +56,15 @@ type Telemetry struct {
 	// SDK never initialized.
 	loggerShutdown func(context.Context) error
 
+	// tracer emits the 3.9 short state-change spans (over the OTLP Traces
+	// signal), defined only when the traces SDK initialized. Nil means
+	// recordTransitionSpan no-ops.
+	tracer trace.Tracer
+
+	// tracerShutdown flushes and closes the TracerProvider. Nil when the traces
+	// SDK never initialized.
+	tracerShutdown func(context.Context) error
+
 	// shutdown flushes and closes the MeterProvider. Nil when the SDK never
 	// initialized.
 	shutdown func(context.Context) error
@@ -63,12 +73,13 @@ type Telemetry struct {
 // NewTelemetry initializes the OTel SDKs from the environment (3.1): the
 // metrics provider (OTEL_EXPORTER_OTLP_ENDPOINT, OTEL_SERVICE_NAME defaulting
 // to herdr-telemetry, OTEL_RESOURCE_ATTRIBUTES) and, for 3.8's structured
-// state-change events, the logs provider over the same resource and endpoint.
-// Both exporters dial lazily, so an unreachable collector shows up as dropped
-// exports, not a startup failure (Phase 5.4); the only errors here are
-// configuration-level, and each signal is treated the same way: log and run
-// without that signal. With instruments registered it returns the constructed
-// Telemetry; nil means telemetry is disabled and every record method no-ops.
+// state-change events and 3.9's state-change spans, the logs and traces
+// providers over the same resource and endpoint. Each exporter dials lazily,
+// so an unreachable collector shows up as dropped exports, not a startup
+// failure (Phase 5.4); the only errors here are configuration-level, and each
+// signal is treated the same way: log and run without that signal. With
+// instruments registered it returns the constructed Telemetry; nil means
+// telemetry is disabled and every record method no-ops.
 func NewTelemetry(ctx context.Context) *Telemetry {
 	res, err := otel.BuildResource(ctx)
 	if err != nil {
@@ -84,6 +95,7 @@ func NewTelemetry(ctx context.Context) *Telemetry {
 	slog.Info("OTel metrics enabled", "service", otel.ServiceName(res))
 	t.registerUp()
 	t.registerLogger()
+	t.registerTracers()
 	t.registerTransitions()
 	t.registerStateDurations()
 	t.registerAttentionLatency()
@@ -101,6 +113,9 @@ func (t *Telemetry) Shutdown(ctx context.Context) {
 	}
 	if t.loggerShutdown != nil {
 		_ = t.loggerShutdown(ctx)
+	}
+	if t.tracerShutdown != nil {
+		_ = t.tracerShutdown(ctx)
 	}
 }
 
@@ -141,6 +156,52 @@ func (t *Telemetry) registerLogger() {
 	t.logger = lp.Logger(otel.LoggerName)
 	t.loggerShutdown = lshutdown
 	slog.Info("OTel logs enabled", "event", otel.StateChangeEventName)
+}
+
+// registerTracers initializes the 3.9 traces signal: a TracerProvider over the
+// same resource as the metrics provider, exporting state-change spans on the
+// OTLP Traces path of the same OTLP endpoint. Initialization failure (e.g. a
+// stale configuration) disables state-change spans only, never the
+// subscription.
+func (t *Telemetry) registerTracers() {
+	if t.meter == nil {
+		return
+	}
+	tp, tshutdown, err := otel.NewTracerProvider(context.Background(), t.resource)
+	if err != nil {
+		slog.Warn("OTel traces SDK init failed; state-change spans disabled", "error", err)
+		return
+	}
+	t.tracer = tp.Tracer(otel.TracerName)
+	t.tracerShutdown = tshutdown
+	slog.Info("OTel traces enabled", "span", otel.StateChangeEventName)
+}
+
+// recordTransitionSpan emits one short herdr.agent.state_change span (3.9) for
+// a genuine agent state transition, carrying the same high-cardinality ids as
+// the 3.8 event record (herdr.agent.id and herdr.workspace.id) plus agent.type
+// and previous/current state. Root span, started at the transition's observed
+// time and ended immediately — never open-ended. A nil Telemetry or tracer
+// (telemetry disabled or init failed) is a no-op.
+//
+// herdr.state.source is deliberately absent, same as 3.8: the plan reserved it
+// for pane.report_agent's source field, which is verified-absent from pushed
+// status events (finding #3).
+func (t *Telemetry) recordTransitionSpan(tr tracker.AgentTransition) {
+	if t == nil || t.tracer == nil {
+		return
+	}
+	_, span := t.tracer.Start(context.Background(), otel.StateChangeEventName,
+		trace.WithTimestamp(tr.ObservedAt),
+	)
+	span.SetAttributes(
+		attribute.String(otel.AgentIDKey, tr.PaneID),
+		attribute.String(otel.AgentTypeKey, tr.Agent),
+		attribute.String(otel.WorkspaceIDKey, tr.WorkspaceID),
+		attribute.String(otel.AgentPreviousState, string(tr.Previous)),
+		attribute.String(otel.AgentStateKey, string(tr.New)),
+	)
+	span.End()
 }
 
 // recordTransitionEvent emits one herdr.agent.state_change event record (3.8)
