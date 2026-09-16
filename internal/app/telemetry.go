@@ -8,7 +8,9 @@ import (
 	"log/slog"
 
 	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/log"
 	"go.opentelemetry.io/otel/metric"
+	"go.opentelemetry.io/otel/sdk/resource"
 
 	"github.com/nabutabu/herdr-scribe/internal/otel"
 	"github.com/nabutabu/herdr-scribe/internal/snapshot"
@@ -24,6 +26,12 @@ type Telemetry struct {
 	// the OTel SDK initialized successfully.
 	meter metric.Meter
 
+	// resource is the resolved OTel resource, shared by the meter and logger
+	// providers so every exported datum (metric, event record) carries the
+	// same service/machine identity. Nil only on the test-constructed paths
+	// that never build a resource.
+	resource *resource.Resource
+
 	// transitions is the herdr.agent.state.transitions counter (3.3), defined
 	// only when telemetry initialized. Nil means recordTransition no-ops.
 	transitions metric.Int64Counter
@@ -38,19 +46,29 @@ type Telemetry struct {
 	// recordAttentionLatency no-ops.
 	attentionLatencyHistogram metric.Float64Histogram
 
+	// logger emits the 3.8 structured state-change events (over the OTLP Logs
+	// signal), defined only when the logs SDK initialized. Nil means
+	// recordTransitionEvent no-ops.
+	logger log.Logger
+
+	// loggerShutdown flushes and closes the LoggerProvider. Nil when the logs
+	// SDK never initialized.
+	loggerShutdown func(context.Context) error
+
 	// shutdown flushes and closes the MeterProvider. Nil when the SDK never
 	// initialized.
 	shutdown func(context.Context) error
 }
 
-// NewTelemetry initializes the OTel metrics SDK from the environment (3.1):
-// OTEL_EXPORTER_OTLP_ENDPOINT, OTEL_SERVICE_NAME (default herdr-telemetry),
-// and OTEL_RESOURCE_ATTRIBUTES. The exporter dials lazily, so an unreachable
-// collector shows up as dropped exports, not a startup failure (Phase 5.4);
-// the only errors here are configuration-level, and both are treated the same
-// way: log and run without telemetry. With instruments registered it returns
-// the constructed Telemetry; nil means telemetry is disabled and every record
-// method no-ops.
+// NewTelemetry initializes the OTel SDKs from the environment (3.1): the
+// metrics provider (OTEL_EXPORTER_OTLP_ENDPOINT, OTEL_SERVICE_NAME defaulting
+// to herdr-telemetry, OTEL_RESOURCE_ATTRIBUTES) and, for 3.8's structured
+// state-change events, the logs provider over the same resource and endpoint.
+// Both exporters dial lazily, so an unreachable collector shows up as dropped
+// exports, not a startup failure (Phase 5.4); the only errors here are
+// configuration-level, and each signal is treated the same way: log and run
+// without that signal. With instruments registered it returns the constructed
+// Telemetry; nil means telemetry is disabled and every record method no-ops.
 func NewTelemetry(ctx context.Context) *Telemetry {
 	res, err := otel.BuildResource(ctx)
 	if err != nil {
@@ -62,22 +80,28 @@ func NewTelemetry(ctx context.Context) *Telemetry {
 		slog.Warn("OTel SDK init failed; telemetry disabled", "error", err)
 		return nil
 	}
-	t := &Telemetry{meter: mp.Meter(otel.MeterName), shutdown: shutdown}
+	t := &Telemetry{meter: mp.Meter(otel.MeterName), resource: res, shutdown: shutdown}
 	slog.Info("OTel metrics enabled", "service", otel.ServiceName(res))
 	t.registerUp()
+	t.registerLogger()
 	t.registerTransitions()
 	t.registerStateDurations()
 	t.registerAttentionLatency()
 	return t
 }
 
-// Shutdown flushes and closes the MeterProvider. Safe on a nil Telemetry and
-// when telemetry was never initialized.
+// Shutdown flushes and closes the providers. Safe on a nil Telemetry and when
+// telemetry was never initialized.
 func (t *Telemetry) Shutdown(ctx context.Context) {
-	if t == nil || t.shutdown == nil {
+	if t == nil {
 		return
 	}
-	_ = t.shutdown(ctx)
+	if t.shutdown != nil {
+		_ = t.shutdown(ctx)
+	}
+	if t.loggerShutdown != nil {
+		_ = t.loggerShutdown(ctx)
+	}
 }
 
 // registerUp registers the 3.1 proof metric: herdr.up reports 1 for as long as
@@ -98,6 +122,53 @@ func (t *Telemetry) registerUp() {
 	if err != nil {
 		slog.Warn("registering "+otel.UpMetricName+" failed", "error", err)
 	}
+}
+
+// registerLogger initializes the 3.8 logs signal: a LoggerProvider over the
+// same resource as the metrics provider, exporting state-change event records
+// on the OTLP Logs path of the same OTLP endpoint. Initialization failure
+// (e.g. a stale configuration) disables state-change events only, never the
+// subscription.
+func (t *Telemetry) registerLogger() {
+	if t.meter == nil {
+		return
+	}
+	lp, lshutdown, err := otel.NewLoggerProvider(context.Background(), t.resource)
+	if err != nil {
+		slog.Warn("OTel logs SDK init failed; state-change events disabled", "error", err)
+		return
+	}
+	t.logger = lp.Logger(otel.LoggerName)
+	t.loggerShutdown = lshutdown
+	slog.Info("OTel logs enabled", "event", otel.StateChangeEventName)
+}
+
+// recordTransitionEvent emits one herdr.agent.state_change event record (3.8)
+// for a genuine agent state transition, tagged with the high-cardinality
+// resource ids the 3.3 counter excludes (herdr.agent.id and
+// herdr.workspace.id) plus agent.type and previous/current state. A nil
+// Telemetry or logger (telemetry disabled or init failed) is a no-op.
+//
+// herdr.state.source is deliberately absent — the plan reserved it for
+// pane.report_agent's source field, which is verified-absent from pushed
+// status events (finding #3), so emitting it would be a permanent no-op.
+func (t *Telemetry) recordTransitionEvent(tr tracker.AgentTransition) {
+	if t == nil || t.logger == nil {
+		return
+	}
+	rec := log.Record{}
+	rec.SetEventName(otel.StateChangeEventName)
+	rec.SetTimestamp(tr.ObservedAt)
+	rec.SetSeverity(log.SeverityInfo)
+	rec.SetBody(attribute.StringValue(otel.StateChangeEventBody))
+	rec.AddAttributes(
+		attribute.String(otel.AgentIDKey, tr.PaneID),
+		attribute.String(otel.AgentTypeKey, tr.Agent),
+		attribute.String(otel.WorkspaceIDKey, tr.WorkspaceID),
+		attribute.String(otel.AgentPreviousState, string(tr.Previous)),
+		attribute.String(otel.AgentStateKey, string(tr.New)),
+	)
+	t.logger.Emit(context.Background(), rec)
 }
 
 // registerTransitions registers the 3.3 herdr.agent.state.transitions counter.

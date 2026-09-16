@@ -195,6 +195,8 @@ internal/otel/
                                 #   OTEL_RESOURCE_ATTRIBUTES, herdr-telemetry default)
   meter.go                     # NewMeterProvider: OTLP/gRPC exporter + periodic reader (3.1),
                                 #   MeterName/UpMetricName consts (herdr.up proof gauge)
+  log.go                       # NewLoggerProvider: OTLP/gRPC logs exporter + batch processor (3.8),
+                                #   StateChangeEventName/Body + AgentIDKey consts
 internal/tracker/
   tracker.go                   # Tracker: mutex-guarded workspaces/tabs/panes/agents maps.
                                 #   Per-kind ApplyWorkspaceCreated/.../ApplyAgentStatusChanged/
@@ -367,6 +369,34 @@ Implemented and tested, as of the current `main` branch:
   no state attribute participates (unlike 3.4); bounded cardinality by
   construction. `app.Run` still keeps a `slog.Debug` on each close for local
   troubleshooting.
+- **3.6/3.7** — state-count and concurrency gauges
+  (`internal/otel/meter.go`'s `NewAgentCountGauges` + `ActiveAgentsMetricName`
+  (herdr.agent.active) and siblings for blocked/idle/done/unknown, and
+  `NewWorkspaceConcurrentGauge`/`WorkspaceConcurrentMetricName`
+  (herdr.workspace.agent.concurrent); `Telemetry.registerCountGauges` wires
+  them to `Tracker.Counts()` on a single per-collection callback). Each 3.6
+  gauge observes a global datapoint plus one per workspace carrying
+  `herdr.workspace.id`; 3.7 is per-workspace only (working+blocked sum, the
+  mission's "concurrent agent work"). Both always emit explicit zeros, so
+  per-workspace series never go stale — the config flag the plan's cardinality
+  caution suggested was deliberately dropped in favor of always-emit,
+  revisit-able when Phase 4.2 config lands.
+- **3.8** — structured state-change *events* over the OTLP Logs signal
+  (`internal/otel/log.go`'s `NewLoggerProvider` (otlploggrpc exporter, batch
+  processor, ~1s cadence, lazy-dial like the metrics path) and
+  `NewLoggerProviderWithProcessor` test seam; `Telemetry.registerLogger`/
+  `recordTransitionEvent`). Each genuine transition (the same `Transitions()`
+  channel while feeding 3.3) emits one `log.Record` with event name
+  `herdr.agent.state_change` (shared with 3.9's span), `tr.ObservedAt` as the
+  timestamp, and attributes `herdr.agent.id` (the PaneID — no standalone
+  agent id exists on the wire, finding #3), `herdr.agent.type`,
+  `herdr.workspace.id`, `herdr.agent.previous_state`, `herdr.agent.state`.
+  **`herdr.state.source` is deliberately not emitted** — that field is
+  verified-absent from pushed status events (finding #3), so it would be a
+  permanent no-op; see the note in `log.go` for the hook if the wire ever
+  carries one. Event records are transient logs, not long-lived series, so the
+  high-cardinality ids are fine un-gated (no 3.6-style config flag). Requires
+  a `logs:` pipeline in the Phase 6 collector.
 
 **Not yet implemented** — confirmed by `grep`, not just absence from this
 list:
@@ -377,8 +407,12 @@ list:
   *within* a running process — it does not protect against the process
   itself crashing (finding #1). This is the top open item.
 - **Phase 3 (OTel/OTLP export)** — 3.1, 3.2 (resource attributes), **3.3**,
-  **3.4**, and **3.5** landed (see above); **3.6–3.9 not implemented**:
-  `Tracker.Counts()` is implemented but nothing reads it yet.
+  **3.4**, **3.5**, **3.6**/**3.7**, and **3.8** landed (see above);
+  **3.9 not implemented** — of the three planned signals
+  (counter/histogram/gauges counts above, plus 3.3–3.8), only the short
+  `herdr.agent.state_change` *spans* (3.9) remain. They will share the same
+  `Transitions()` feed and event name as 3.8 and need a trace SDK + OTLP trace
+  exporter, neither of which is in go.mod yet.
 - **Phase 4 (plugin packaging)** — no `herdr-plugin.toml` in the repo.
 - **Phases 5–6** — reliability hardening and the local demo stack.
 

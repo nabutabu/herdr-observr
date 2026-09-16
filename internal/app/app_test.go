@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"sync"
 	"testing"
 
 	"github.com/nabutabu/herdr-scribe/internal/events"
@@ -9,6 +10,7 @@ import (
 	"github.com/nabutabu/herdr-scribe/internal/snapshot"
 	"github.com/nabutabu/herdr-scribe/internal/tracker"
 	"go.opentelemetry.io/otel/attribute"
+	sdklog "go.opentelemetry.io/otel/sdk/log"
 	"go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 	"go.opentelemetry.io/otel/sdk/resource"
@@ -97,13 +99,15 @@ func TestNewTelemetryRegistersUpGauge(t *testing.T) {
 }
 
 // drainTransitions replicates Run's select-case consumer, forwarding each
-// transition to the counter exactly as production does.
+// transition to the counter and the 3.8 event logger exactly as production
+// does.
 func drainTransitions(t *testing.T, a *App) {
 	t.Helper()
 	for {
 		select {
 		case tr := <-a.tr.Transitions():
 			a.telemetry.recordTransition(tr)
+			a.telemetry.recordTransitionEvent(tr)
 		default:
 			return
 		}
@@ -137,6 +141,55 @@ func drainAttentionLatency(t *testing.T, a *App) {
 			return
 		}
 	}
+}
+
+// captureLogExporter is a minimal sdklog.Exporter that snapshots emitted
+// event records for assertion, wired synchronously through a SimpleProcessor so
+// records are captured at Emit time.
+type captureLogExporter struct {
+	mu      sync.Mutex
+	records []sdklog.Record
+}
+
+func (c *captureLogExporter) Export(_ context.Context, records []sdklog.Record) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.records = append(c.records, records...)
+	return nil
+}
+
+func (c *captureLogExporter) Shutdown(context.Context) error { return nil }
+
+func (c *captureLogExporter) ForceFlush(context.Context) error { return nil }
+
+func (c *captureLogExporter) snapshot() []sdklog.Record {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := make([]sdklog.Record, len(c.records))
+	copy(out, c.records)
+	return out
+}
+
+// telemetryWithLogger builds a Telemetry whose 3.8 event logger is wired to a
+// synchronous capture exporter, the logs analogue of the manual-reader seam the
+// metric tests use.
+func telemetryWithLogger(t *testing.T) (*Telemetry, *captureLogExporter) {
+	t.Helper()
+	capt := &captureLogExporter{}
+	lp := otel.NewLoggerProviderWithProcessor(sdklog.NewSimpleProcessor(capt), resource.NewSchemaless(attribute.String("service.name", "test")))
+	t.Cleanup(func() { _ = lp.Shutdown(context.Background()) })
+	return &Telemetry{logger: lp.Logger(otel.LoggerName)}, capt
+}
+
+// logRecordAttrs flattens a captured log record's attributes by key.
+func logRecordAttrs(t *testing.T, rec sdklog.Record) map[string]string {
+	t.Helper()
+	m := map[string]string{}
+	rec.WalkAttributes(func(kv attribute.KeyValue) bool {
+		m[string(kv.Key)] = kv.Value.AsString()
+		return true
+	})
+	return m
 }
 
 func findInt64SumPoints(t *testing.T, rm metricdata.ResourceMetrics, name string) []metricdata.DataPoint[int64] {
@@ -304,6 +357,81 @@ func TestRecordTransitionNoopWithoutTelemetry(t *testing.T) {
 	select {
 	case trns := <-tr.Transitions():
 		a.telemetry.recordTransition(trns)
+	default:
+		t.Fatal("expected a transition from the tracker")
+	}
+}
+
+func TestRecordTransitionEventEventDriven(t *testing.T) {
+	// (3.8) One herdr.agent.state_change event record per genuine transition,
+	// tagged with the high-cardinality ids the 3.3 counter excludes plus
+	// type/workspace/previous/current state. First-seen upserts emit nothing.
+	telemetry, capt := telemetryWithLogger(t)
+	a := &App{telemetry: telemetry, tr: tracker.NewTracker()}
+
+	a.handleEvent(statusEv(snapshot.AgentStatusWorking)) // first-seen: no transition
+	a.handleEvent(statusEv(snapshot.AgentStatusBlocked)) // working→blocked
+	drainTransitions(t, a)
+
+	got := capt.snapshot()
+	if len(got) != 1 {
+		t.Fatalf("event records = %d, want 1 (first-seen emits none)", len(got))
+	}
+	rec := got[0]
+	if rec.EventName() != otel.StateChangeEventName {
+		t.Errorf("event name = %q, want %q", rec.EventName(), otel.StateChangeEventName)
+	}
+	if rec.Timestamp().IsZero() {
+		t.Error("event timestamp is zero; want the transition's observed time")
+	}
+	attrs := logRecordAttrs(t, rec)
+	for key, want := range map[string]string{
+		otel.AgentIDKey:         "w1:p1",
+		otel.AgentTypeKey:       "codex",
+		otel.WorkspaceIDKey:     "w1",
+		otel.AgentPreviousState: "working",
+		otel.AgentStateKey:      "blocked",
+	} {
+		if got := attrs[key]; got != want {
+			t.Errorf("attribute %q = %q, want %q", key, got, want)
+		}
+	}
+	if attrs["herdr.state.source"] != "" {
+		t.Errorf("herdr.state.source present = %q; verified-absent from pushed status events (finding #3)", attrs["herdr.state.source"])
+	}
+}
+
+func TestRecordTransitionEventSeenFlip(t *testing.T) {
+	// The silent reconcile-detected close path (2.4): done is flip-flopped to
+	// idle by ApplySeenFlip, exactly as onReport does in production — that is
+	// still a genuine transition and must emit an event record too.
+	telemetry, capt := telemetryWithLogger(t)
+	a := &App{telemetry: telemetry, tr: tracker.NewTracker()}
+
+	a.handleEvent(statusEv(snapshot.AgentStatusDone))
+	a.tr.ApplySeenFlip("w1:p1")
+	drainTransitions(t, a)
+
+	got := capt.snapshot()
+	if len(got) != 1 {
+		t.Fatalf("event records = %d, want 1", len(got))
+	}
+	attrs := logRecordAttrs(t, got[0])
+	if attrs[otel.AgentPreviousState] != "done" || attrs[otel.AgentStateKey] != "idle" {
+		t.Errorf("seen-flip event attrs = %v, want previous=done state=idle", attrs)
+	}
+}
+
+func TestRecordTransitionEventNoopWithoutTelemetry(t *testing.T) {
+	// Telemetry disabled (nil logger): emitting events must be a no-op, never
+	// a panic or block.
+	a := &App{tr: tracker.NewTracker()}
+	tr := tracker.NewTracker()
+	tr.ApplyAgentStatusChanged(statusEv(snapshot.AgentStatusWorking))
+	tr.ApplyAgentStatusChanged(statusEv(snapshot.AgentStatusBlocked))
+	select {
+	case trns := <-tr.Transitions():
+		a.telemetry.recordTransitionEvent(trns)
 	default:
 		t.Fatal("expected a transition from the tracker")
 	}
