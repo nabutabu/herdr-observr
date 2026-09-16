@@ -4,8 +4,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nabutabu/herdr-scribe/internal/events"
-	"github.com/nabutabu/herdr-scribe/internal/snapshot"
+	"github.com/nabutabu/herdr-observr/internal/events"
+	"github.com/nabutabu/herdr-observr/internal/snapshot"
 )
 
 // statusChange builds the minimal event shape a status transition carries on

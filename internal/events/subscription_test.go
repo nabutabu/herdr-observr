@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nabutabu/herdr-scribe/internal/client"
+	"github.com/nabutabu/herdr-observr/internal/client"
 )
 
 func TestBuildParams(t *testing.T) {
@@ -142,13 +142,13 @@ func TestSubscribeFromSnapshotReturnsSubscribedPaneIDs(t *testing.T) {
 				}
 				switch req.Method {
 				case "session.snapshot":
-					fmt.Fprintf(conn, `{"id":"herdr-scribe","result":%s}`+"\n", snapshotBody)
+					fmt.Fprintf(conn, `{"id":"herdr-observr","result":%s}`+"\n", snapshotBody)
 				case "events.subscribe":
 					if err := compareSubscriptions(req.Params, BuildParams([]string{"w1:p1", "w1:p2"})); err != nil {
 						errCh <- err
 						return
 					}
-					fmt.Fprintf(conn, `{"id":"herdr-scribe","result":{"ok":true}}`+"\n")
+					fmt.Fprintf(conn, `{"id":"herdr-observr","result":{"ok":true}}`+"\n")
 				default:
 					errCh <- fmt.Errorf("unexpected method %q", req.Method)
 				}

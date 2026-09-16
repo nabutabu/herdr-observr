@@ -1,6 +1,6 @@
 {
-  "uid": "herdr-scribe",
-  "title": "herdr-scribe — agent health",
+  "uid": "herdr-observr",
+  "title": "herdr-observr — agent health",
   "tags": ["herdr", "otel"],
   "timezone": "browser",
   "schemaVersion": 39,
@@ -114,7 +114,7 @@
     {
       "id": 6,
       "type": "stat",
-      "title": "herdr-scribe up",
+      "title": "herdr-observr up",
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "gridPos": { "h": 8, "w": 4, "x": 12, "y": 16 },
       "fieldConfig": {

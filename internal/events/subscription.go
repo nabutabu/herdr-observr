@@ -4,7 +4,7 @@ import (
 	"context"
 	"log/slog"
 
-	"github.com/nabutabu/herdr-scribe/internal/snapshot"
+	"github.com/nabutabu/herdr-observr/internal/snapshot"
 )
 
 // SubscriptionType is the event name Herdr accepts in an events.subscribe

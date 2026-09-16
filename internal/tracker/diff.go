@@ -6,7 +6,7 @@ import (
 	"log/slog"
 	"time"
 
-	"github.com/nabutabu/herdr-scribe/internal/snapshot"
+	"github.com/nabutabu/herdr-observr/internal/snapshot"
 )
 
 // Drift is one observed difference between tracked state and a snapshot.

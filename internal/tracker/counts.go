@@ -3,7 +3,7 @@ package tracker
 import (
 	"log/slog"
 
-	"github.com/nabutabu/herdr-scribe/internal/snapshot"
+	"github.com/nabutabu/herdr-observr/internal/snapshot"
 )
 
 // AgentCounts is a point-in-time copy of the live per-state agent counts,

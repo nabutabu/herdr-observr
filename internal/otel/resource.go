@@ -6,7 +6,7 @@ import (
 	"log/slog"
 	"os"
 
-	"github.com/nabutabu/herdr-scribe/internal/machineid"
+	"github.com/nabutabu/herdr-observr/internal/machineid"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/sdk/resource"
 )

@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/nabutabu/herdr-scribe/internal/snapshot"
+	"github.com/nabutabu/herdr-observr/internal/snapshot"
 )
 
 // Kind identifies which lifecycle event a NormalizedEvent represents.

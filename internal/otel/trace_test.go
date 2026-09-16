@@ -60,12 +60,12 @@ func spanAttributeMap(s sdktrace.ReadOnlySpan) map[string]string {
 
 func TestStateChangeSpanConstantContract(t *testing.T) {
 	// (3.9) Pin the scope name: the tracer must report the same instrumentation
-	// scope name as the meter and logger so backends can group all herdr-scribe
+	// scope name as the meter and logger so backends can group all herdr-observr
 	// signals by scope. The span name itself is already pinned by
 	// TestStateChangeEventConstantContract (StateChangeEventName is shared
 	// between 3.8 and 3.9).
-	if TracerName != "herdr-scribe" {
-		t.Errorf("TracerName = %q, want %q", TracerName, "herdr-scribe")
+	if TracerName != "herdr-observr" {
+		t.Errorf("TracerName = %q, want %q", TracerName, "herdr-observr")
 	}
 }
 

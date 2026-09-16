@@ -30,10 +30,10 @@ import (
 // Privacy constraint: attributes are ids/states/timestamps only. No pane
 // content, terminal output, or agent transcript ever rides on a span.
 const (
-	// TracerName is the instrumentation scope name for all herdr-scribe
+	// TracerName is the instrumentation scope name for all herdr-observr
 	// tracers, mirroring MeterName on the metrics side and LoggerName on the
 	// logs side.
-	TracerName = "herdr-scribe"
+	TracerName = "herdr-observr"
 )
 
 // NewTracerProvider initializes the OTel traces SDK with the OTLP/gRPC

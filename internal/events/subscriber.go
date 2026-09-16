@@ -9,7 +9,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/nabutabu/herdr-scribe/internal/client"
+	"github.com/nabutabu/herdr-observr/internal/client"
 )
 
 // Subscriber owns a single dedicated connection to the Herdr socket used
@@ -35,7 +35,7 @@ func NewSubscriber(params map[string]any) (*Subscriber, error) {
 
 	conn.SetWriteDeadline(time.Now().Add(client.WRITE_DEADLINE))
 	if err := client.WriteFrame(conn, &client.Request{
-		ID:     "herdr-scribe",
+		ID:     "herdr-observr",
 		Method: "events.subscribe",
 		Params: params,
 	}); err != nil {

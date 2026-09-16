@@ -19,8 +19,8 @@ const (
 	// a collector blip is absorbed rather than losing a sample outright.
 	exportInterval = 10 * time.Second
 
-	// MeterName is the instrumentation scope name for all herdr-scribe meters.
-	MeterName = "herdr-scribe"
+	// MeterName is the instrumentation scope name for all herdr-observr meters.
+	MeterName = "herdr-observr"
 
 	// UpMetricName is the 3.1 proof/liveness metric: 1 while this process is
 	// alive and exporting. Registered by App on startup.

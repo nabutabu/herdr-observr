@@ -43,7 +43,7 @@ func setSocketPath(t *testing.T, path string) {
 
 func TestWriteFrame(t *testing.T) {
 	var buf bytes.Buffer
-	req := &Request{ID: "herdr-scribe", Method: "ping", Params: map[string]any{"k": "v"}}
+	req := &Request{ID: "herdr-observr", Method: "ping", Params: map[string]any{"k": "v"}}
 	if err := WriteFrame(&buf, req); err != nil {
 		t.Fatalf("WriteFrame: %v", err)
 	}
@@ -57,7 +57,7 @@ func TestWriteFrame(t *testing.T) {
 	if err := json.Unmarshal(TrimNewline(got), &parsed); err != nil {
 		t.Fatalf("unmarshal frame: %v", err)
 	}
-	if parsed.ID != "herdr-scribe" || parsed.Method != "ping" {
+	if parsed.ID != "herdr-observr" || parsed.Method != "ping" {
 		t.Errorf("unexpected frame: %+v", parsed)
 	}
 	if parsed.Params["k"] != "v" {
@@ -115,10 +115,10 @@ func TestCallPing(t *testing.T) {
 		if err := json.Unmarshal(TrimNewline(line), &req); err != nil {
 			return fmt.Errorf("parsing request: %w", err)
 		}
-		if req.ID != "herdr-scribe" || req.Method != "ping" {
+		if req.ID != "herdr-observr" || req.Method != "ping" {
 			return fmt.Errorf("unexpected request: %+v", req)
 		}
-		_, err = conn.Write([]byte(`{"id":"herdr-scribe","result":"pong"}` + "\n"))
+		_, err = conn.Write([]byte(`{"id":"herdr-observr","result":"pong"}` + "\n"))
 		return err
 	})
 	setSocketPath(t, sock)
@@ -142,7 +142,7 @@ func TestCallRPCError(t *testing.T) {
 		if _, err := r.ReadBytes('\n'); err != nil {
 			return err
 		}
-		_, err := conn.Write([]byte(`{"id":"herdr-scribe","error":{"code":"MethodNotFound","message":"no such method: ping"}}` + "\n"))
+		_, err := conn.Write([]byte(`{"id":"herdr-observr","error":{"code":"MethodNotFound","message":"no such method: ping"}}` + "\n"))
 		return err
 	})
 	setSocketPath(t, sock)
@@ -196,7 +196,7 @@ func TestCallContextTimeout(t *testing.T) {
 		}
 		time.Sleep(200 * time.Millisecond)
 		// Client has hung up by now; ignore the write error.
-		conn.Write([]byte(`{"id":"herdr-scribe","result":"pong"}` + "\n"))
+		conn.Write([]byte(`{"id":"herdr-observr","result":"pong"}` + "\n"))
 		return nil
 	})
 	setSocketPath(t, sock)

@@ -1,4 +1,4 @@
-// Package otel initializes the OpenTelemetry metrics SDK for herdr-scribe
+// Package otel initializes the OpenTelemetry metrics SDK for herdr-observr
 // (plan 3.1). It builds the resource from the environment and constructs a
 // MeterProvider whose OTLP/gRPC exporter reads its endpoint, TLS, headers,
 // and timeout from the standard OTEL_EXPORTER_OTLP_* variables, so endpoint

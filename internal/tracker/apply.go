@@ -4,8 +4,8 @@ import (
 	"log/slog"
 	"time"
 
-	"github.com/nabutabu/herdr-scribe/internal/events"
-	"github.com/nabutabu/herdr-scribe/internal/snapshot"
+	"github.com/nabutabu/herdr-observr/internal/events"
+	"github.com/nabutabu/herdr-observr/internal/snapshot"
 )
 
 // ApplyWorkspaceCreated folds a workspace.created event into the tracked state.

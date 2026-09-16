@@ -7,7 +7,7 @@ import (
 	"testing"
 
 	"github.com/google/uuid"
-	"github.com/nabutabu/herdr-scribe/internal/machineid"
+	"github.com/nabutabu/herdr-observr/internal/machineid"
 	"go.opentelemetry.io/otel/sdk/resource"
 )
 

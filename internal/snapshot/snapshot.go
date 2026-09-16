@@ -5,7 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 
-	"github.com/nabutabu/herdr-scribe/internal/client"
+	"github.com/nabutabu/herdr-observr/internal/client"
 )
 
 // Response is the top-level session.snapshot envelope. The wire frame also

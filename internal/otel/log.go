@@ -30,9 +30,9 @@ import (
 // Privacy constraint: attributes are ids/states/timestamps only. No pane
 // content, terminal output, or agent transcript ever rides on an event record.
 const (
-	// LoggerName is the instrumentation scope name for all herdr-scribe
+	// LoggerName is the instrumentation scope name for all herdr-observr
 	// loggers, mirroring MeterName on the metrics side.
-	LoggerName = "herdr-scribe"
+	LoggerName = "herdr-observr"
 
 	// StateChangeEventName is the event name on every 3.8 transition event
 	// record. Shared with 3.9's herdr.agent.state_change span.

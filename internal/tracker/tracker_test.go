@@ -15,8 +15,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nabutabu/herdr-scribe/internal/events"
-	"github.com/nabutabu/herdr-scribe/internal/snapshot"
+	"github.com/nabutabu/herdr-observr/internal/events"
+	"github.com/nabutabu/herdr-observr/internal/snapshot"
 )
 
 func TestMain(m *testing.M) {
@@ -1307,12 +1307,12 @@ func TestApplyTabLifecycleTracksState(t *testing.T) {
 	tr := NewTracker()
 	tr.now = func() time.Time { return cur }
 
-	tr.ApplyTabCreated(events.NormalizedEvent{TabID: "w1:t1", WorkspaceID: "w1", Label: "herdr-scribe"})
+	tr.ApplyTabCreated(events.NormalizedEvent{TabID: "w1:t1", WorkspaceID: "w1", Label: "herdr-observr"})
 
 	tr.mu.RLock()
 	tab := tr.tabs["w1:t1"]
 	tr.mu.RUnlock()
-	if tab.Label != "herdr-scribe" || tab.WorkspaceID != "w1" {
+	if tab.Label != "herdr-observr" || tab.WorkspaceID != "w1" {
 		t.Fatalf("tab after created = %+v", tab)
 	}
 
@@ -1462,7 +1462,7 @@ func startSnapshotStub(t *testing.T, respond func() string) string {
 					return
 				}
 				if req.Method != "session.snapshot" {
-					fmt.Fprintf(conn, `{"id":"herdr-scribe","error":{"code":"MethodNotFound","message":"no such method: %s"}}`+"\n", req.Method)
+					fmt.Fprintf(conn, `{"id":"herdr-observr","error":{"code":"MethodNotFound","message":"no such method: %s"}}`+"\n", req.Method)
 					return
 				}
 				body := respond()
@@ -1470,7 +1470,7 @@ func startSnapshotStub(t *testing.T, respond func() string) string {
 					conn.Write([]byte("this is not json\n"))
 					return
 				}
-				fmt.Fprintf(conn, `{"id":"herdr-scribe","result":%s}`+"\n", body)
+				fmt.Fprintf(conn, `{"id":"herdr-observr","result":%s}`+"\n", body)
 			}(conn)
 		}
 	}()

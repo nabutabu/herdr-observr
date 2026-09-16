@@ -1,4 +1,4 @@
-# herdr-scribe
+# herdr-observr
 
 Agent runtime telemetry for Herdr exported over OpenTelemetry, without ever
 transmitting what the agents are actually doing.
@@ -32,7 +32,7 @@ Implemented so far:
 ## Build
 
 ```sh
-go build -o herdr-scribe .
+go build -o herdr-observr .
 ```
 
 ## Run
@@ -40,13 +40,13 @@ go build -o herdr-scribe .
 The binary sends `ping` over Herdr's Unix socket and confirms `pong`:
 
 ```sh
-./herdr-scribe
+./herdr-observr
 ```
 
 The socket path is read from `HERDR_SOCKET_PATH` and NEEDS to be set in order to run correctly
 
 ```sh
-HERDR_SOCKET_PATH=/path/to/your/herdr.sock ./herdr-scribe
+HERDR_SOCKET_PATH=/path/to/your/herdr.sock ./herdr-observr
 ```
 
 ## Test

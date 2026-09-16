@@ -9,10 +9,10 @@ import (
 	"log/slog"
 	"time"
 
-	"github.com/nabutabu/herdr-scribe/internal/client"
-	"github.com/nabutabu/herdr-scribe/internal/events"
-	"github.com/nabutabu/herdr-scribe/internal/snapshot"
-	"github.com/nabutabu/herdr-scribe/internal/tracker"
+	"github.com/nabutabu/herdr-observr/internal/client"
+	"github.com/nabutabu/herdr-observr/internal/events"
+	"github.com/nabutabu/herdr-observr/internal/snapshot"
+	"github.com/nabutabu/herdr-observr/internal/tracker"
 )
 
 const maxInitialAttempts = 5

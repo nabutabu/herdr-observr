@@ -1,4 +1,4 @@
-module github.com/nabutabu/herdr-scribe
+module github.com/nabutabu/herdr-observr
 
 go 1.26.7
 

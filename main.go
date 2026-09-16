@@ -7,7 +7,7 @@ import (
 	"os/signal"
 	"syscall"
 
-	"github.com/nabutabu/herdr-scribe/internal/app"
+	"github.com/nabutabu/herdr-observr/internal/app"
 )
 
 func main() {

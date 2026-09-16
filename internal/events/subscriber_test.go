@@ -13,8 +13,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nabutabu/herdr-scribe/internal/client"
-	"github.com/nabutabu/herdr-scribe/internal/snapshot"
+	"github.com/nabutabu/herdr-observr/internal/client"
+	"github.com/nabutabu/herdr-observr/internal/snapshot"
 )
 
 func TestMain(m *testing.M) {
@@ -94,7 +94,7 @@ func readSubscribeFrame(r *bufio.Reader) (*client.Request, error) {
 	if err := json.Unmarshal(line, &req); err != nil {
 		return nil, fmt.Errorf("parsing subscribe frame %q: %w", string(line), err)
 	}
-	if req.ID != "herdr-scribe" || req.Method != "events.subscribe" {
+	if req.ID != "herdr-observr" || req.Method != "events.subscribe" {
 		return nil, fmt.Errorf("unexpected subscribe frame: %+v", req)
 	}
 	return &req, nil
@@ -172,7 +172,7 @@ func TestSubscribeDeliversNormalizedEvents(t *testing.T) {
 		state snapshot.AgentStatus
 	}{
 		{
-			raw:   `{"data":{"type":"workspace_created","workspace":{"active_tab_id":"wS:t1","agent_status":"unknown","focused":true,"label":"herdr-scribe","number":2,"pane_count":1,"tab_count":1,"workspace_id":"wS"}},"event":"workspace_created"}`,
+			raw:   `{"data":{"type":"workspace_created","workspace":{"active_tab_id":"wS:t1","agent_status":"unknown","focused":true,"label":"herdr-observr","number":2,"pane_count":1,"tab_count":1,"workspace_id":"wS"}},"event":"workspace_created"}`,
 			kind:  KindWorkspaceCreated,
 			pane:  "",
 			tab:   "",
@@ -257,7 +257,7 @@ func TestSubscribeDropsAck(t *testing.T) {
 			return err
 		}
 		for _, frame := range []string{
-			`{"id":"herdr-scribe","result":{"ok":true}}`,
+			`{"id":"herdr-observr","result":{"ok":true}}`,
 			ev,
 		} {
 			if _, err := fmt.Fprintf(conn, "%s\n", frame); err != nil {
@@ -402,12 +402,12 @@ func TestParseFrame(t *testing.T) {
 		t.Errorf("ev = %+v, want pane.created for w1:p1", ev)
 	}
 
-	ack := json.RawMessage(`{"id":"herdr-scribe","result":{"ok":true}}`)
+	ack := json.RawMessage(`{"id":"herdr-observr","result":{"ok":true}}`)
 	if kind, _, err := parseFrame(ack); err != nil || kind != frameAck {
 		t.Errorf("parseFrame(ack) = (%v, %v), want (frameAck, nil)", kind, err)
 	}
 
-	errResp := json.RawMessage(`{"id":"herdr-scribe","error":{"code":"MethodNotFound","message":"nope"}}`)
+	errResp := json.RawMessage(`{"id":"herdr-observr","error":{"code":"MethodNotFound","message":"nope"}}`)
 	if kind, _, err := parseFrame(errResp); err != nil || kind != frameAck {
 		t.Errorf("parseFrame(error response) = (%v, %v), want (frameAck, nil)", kind, err)
 	}

@@ -6,10 +6,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nabutabu/herdr-scribe/internal/events"
-	"github.com/nabutabu/herdr-scribe/internal/otel"
-	"github.com/nabutabu/herdr-scribe/internal/snapshot"
-	"github.com/nabutabu/herdr-scribe/internal/tracker"
+	"github.com/nabutabu/herdr-observr/internal/events"
+	"github.com/nabutabu/herdr-observr/internal/otel"
+	"github.com/nabutabu/herdr-observr/internal/snapshot"
+	"github.com/nabutabu/herdr-observr/internal/tracker"
 	"go.opentelemetry.io/otel/attribute"
 	sdklog "go.opentelemetry.io/otel/sdk/log"
 	"go.opentelemetry.io/otel/sdk/metric"
@@ -880,7 +880,7 @@ func TestCountGaugesNoopWithoutTelemetry(t *testing.T) {
 func TestHandleEventRoutesTabKinds(t *testing.T) {
 	a := &App{tr: tracker.NewTracker()}
 
-	a.handleEvent(events.NormalizedEvent{Kind: events.KindTabCreated, TabID: "w1:t1", WorkspaceID: "w1", Label: "herdr-scribe"})
+	a.handleEvent(events.NormalizedEvent{Kind: events.KindTabCreated, TabID: "w1:t1", WorkspaceID: "w1", Label: "herdr-observr"})
 	a.handleEvent(events.NormalizedEvent{Kind: events.KindTabRenamed, TabID: "w1:t1", Label: "agents"})
 	a.handleEvent(events.NormalizedEvent{Kind: events.KindTabClosed, TabID: "w1:t1", WorkspaceID: "w1"})
 

@@ -30,7 +30,7 @@ func Call(ctx context.Context, method string, params map[string]any) (json.RawMe
 	conn.SetDeadline(deadline)
 
 	if err := WriteFrame(conn, &Request{
-		ID:     "herdr-scribe",
+		ID:     "herdr-observr",
 		Method: method,
 		Params: params,
 	}); err != nil {

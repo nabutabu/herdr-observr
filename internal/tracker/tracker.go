@@ -5,7 +5,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/nabutabu/herdr-scribe/internal/snapshot"
+	"github.com/nabutabu/herdr-observr/internal/snapshot"
 )
 
 // Tracker holds the live picture of the session as currently known. Steady

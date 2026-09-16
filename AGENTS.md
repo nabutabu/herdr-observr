@@ -1,4 +1,4 @@
-# AGENTS.md — herdr-scribe
+# AGENTS.md — herdr-observr
 
 Guidance for any AI coding agent (or human) working in this repository. Read
 this before making changes — it encodes decisions that were already argued
@@ -7,14 +7,14 @@ first principles will waste time and likely produce a regression.
 
 ## What this project is
 
-`herdr-scribe` is a Go plugin for [Herdr](https://github.com/nabutabu/herdr)
+`herdr-observr` is a Go plugin for [Herdr](https://github.com/nabutabu/herdr)
 (a terminal multiplexer / agent-management tool). It subscribes to Herdr's
 live event stream and exports agent runtime *health* telemetry — where
 agents are stuck, how long they wait for a human, how much concurrent work
 is happening — over OTLP to standard observability backends (Prometheus,
 Tempo, Grafana).
 
-**Strict privacy constraint, non-negotiable:** herdr-scribe never transmits
+**Strict privacy constraint, non-negotiable:** herdr-observr never transmits
 *what* an agent is doing — no pane content, no terminal output, no agent
 transcripts. Only lifecycle/state metadata (ids, states, timestamps) leaves
 the process. Any change that risks putting pane/terminal content on the wire
@@ -60,7 +60,7 @@ trusting *this file* after the code had moved past it. The house rule:
 - When re-fetching this repo itself (e.g. to diff before editing), use the
   tarball approach, not the GitHub tree API or raw-path guessing:
   ```sh
-  curl -sL "https://codeload.github.com/nabutabu/herdr-scribe/tar.gz/refs/heads/main" -o repo.tar.gz \
+  curl -sL "https://codeload.github.com/nabutabu/herdr-observr/tar.gz/refs/heads/main" -o repo.tar.gz \
     && tar xzf repo.tar.gz
   ```
 - Spikes are throwaway. If you write a `cmd/spike-*/main.go` or an

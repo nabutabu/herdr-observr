@@ -13,9 +13,9 @@ import (
 	"go.opentelemetry.io/otel/sdk/resource"
 	"go.opentelemetry.io/otel/trace"
 
-	"github.com/nabutabu/herdr-scribe/internal/otel"
-	"github.com/nabutabu/herdr-scribe/internal/snapshot"
-	"github.com/nabutabu/herdr-scribe/internal/tracker"
+	"github.com/nabutabu/herdr-observr/internal/otel"
+	"github.com/nabutabu/herdr-observr/internal/snapshot"
+	"github.com/nabutabu/herdr-observr/internal/tracker"
 )
 
 // Telemetry owns the process's OTel instruments (Phase 3): the meter, the
@@ -132,7 +132,7 @@ func (t *Telemetry) registerUp() {
 			o.Observe(1)
 			return nil
 		}),
-		metric.WithDescription("1 while the herdr-scribe exporter process is running"),
+		metric.WithDescription("1 while the herdr-observr exporter process is running"),
 	)
 	if err != nil {
 		slog.Warn("registering "+otel.UpMetricName+" failed", "error", err)

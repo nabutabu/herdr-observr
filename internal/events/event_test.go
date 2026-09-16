@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/nabutabu/herdr-scribe/internal/snapshot"
+	"github.com/nabutabu/herdr-observr/internal/snapshot"
 )
 
 func TestNormalizeWorkspaceEvents(t *testing.T) {
@@ -17,13 +17,13 @@ func TestNormalizeWorkspaceEvents(t *testing.T) {
 	}{
 		{
 			name:      "workspace.created",
-			raw:       `{"data":{"type":"workspace_created","workspace":{"active_tab_id":"wS:t1","agent_status":"unknown","focused":true,"label":"herdr-scribe","number":2,"pane_count":1,"tab_count":1,"workspace_id":"wS"}},"event":"workspace_created"}`,
+			raw:       `{"data":{"type":"workspace_created","workspace":{"active_tab_id":"wS:t1","agent_status":"unknown","focused":true,"label":"herdr-observr","number":2,"pane_count":1,"tab_count":1,"workspace_id":"wS"}},"event":"workspace_created"}`,
 			kind:      KindWorkspaceCreated,
 			workspace: "wS",
 		},
 		{
 			name:      "workspace.closed",
-			raw:       `{"data":{"type":"workspace_closed","workspace":{"active_tab_id":"wS:t1","agent_status":"unknown","focused":true,"label":"herdr-scribe","number":2,"pane_count":1,"tab_count":1,"workspace_id":"wS"},"workspace_id":"wS"},"event":"workspace_closed"}`,
+			raw:       `{"data":{"type":"workspace_closed","workspace":{"active_tab_id":"wS:t1","agent_status":"unknown","focused":true,"label":"herdr-observr","number":2,"pane_count":1,"tab_count":1,"workspace_id":"wS"},"workspace_id":"wS"},"event":"workspace_closed"}`,
 			kind:      KindWorkspaceClosed,
 			workspace: "wS",
 		},
@@ -59,7 +59,7 @@ func TestNormalizePaneEvents(t *testing.T) {
 	}{
 		{
 			name:      "pane.created with tab_id",
-			raw:       `{"data":{"pane":{"agent_status":"unknown","cwd":"/home/nabutabu/programs/herdr-scribe","focused":false,"pane_id":"wT:p2","revision":0,"scroll":{"max_offset_from_bottom":0,"offset_from_bottom":0,"viewport_rows":22},"tab_id":"wT:t2","terminal_id":"term_65b27dfff8dfa14","workspace_id":"wT"},"type":"pane_created"},"event":"pane_created"}`,
+			raw:       `{"data":{"pane":{"agent_status":"unknown","cwd":"/home/nabutabu/programs/herdr-observr","focused":false,"pane_id":"wT:p2","revision":0,"scroll":{"max_offset_from_bottom":0,"offset_from_bottom":0,"viewport_rows":22},"tab_id":"wT:t2","terminal_id":"term_65b27dfff8dfa14","workspace_id":"wT"},"type":"pane_created"},"event":"pane_created"}`,
 			kind:      KindPaneCreated,
 			pane:      "wT:p2",
 			workspace: "wT",
@@ -117,11 +117,11 @@ func TestNormalizeTabEvents(t *testing.T) {
 	}{
 		{
 			name:      "tab.created with nested tab object",
-			raw:       `{"data":{"tab":{"agent_status":"working","focused":true,"label":"herdr-scribe","number":2,"pane_count":1,"tab_id":"w1:t1","workspace_id":"w1"},"type":"tab_created"},"event":"tab_created"}`,
+			raw:       `{"data":{"tab":{"agent_status":"working","focused":true,"label":"herdr-observr","number":2,"pane_count":1,"tab_id":"w1:t1","workspace_id":"w1"},"type":"tab_created"},"event":"tab_created"}`,
 			kind:      KindTabCreated,
 			tab:       "w1:t1",
 			workspace: "w1",
-			label:     "herdr-scribe",
+			label:     "herdr-observr",
 		},
 		{
 			name:      "tab.closed flat",
@@ -295,8 +295,8 @@ func TestNormalizeInvalidJSON(t *testing.T) {
 
 func TestNormalizeRejectsAck(t *testing.T) {
 	for _, raw := range []string{
-		`{"id":"herdr-scribe","result":{"ok":true}}`,
-		`{"id":"herdr-scribe","error":{"code":"MethodNotFound","message":"nope"}}`,
+		`{"id":"herdr-observr","result":{"ok":true}}`,
+		`{"id":"herdr-observr","error":{"code":"MethodNotFound","message":"nope"}}`,
 	} {
 		if _, err := Normalize(json.RawMessage(raw)); err == nil {
 			t.Errorf("Normalize(%q): expected error for non-event frame", raw)

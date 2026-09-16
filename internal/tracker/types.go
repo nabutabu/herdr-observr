@@ -3,7 +3,7 @@ package tracker
 import (
 	"time"
 
-	"github.com/nabutabu/herdr-scribe/internal/snapshot"
+	"github.com/nabutabu/herdr-observr/internal/snapshot"
 )
 
 // WorkspaceState is the tracker's record for one workspace. Only identity and

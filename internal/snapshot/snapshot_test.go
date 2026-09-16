@@ -107,7 +107,7 @@ func TestFetch(t *testing.T) {
 		}{}); err != nil {
 			return fmt.Errorf("parsing request: %w", err)
 		}
-		_, err = conn.Write([]byte(`{"id":"herdr-scribe","result":{"type":"session_snapshot","snapshot":{"version":"0.9.0","protocol":22,"tabs":[{"tab_id":"w1:t1","workspace_id":"w1"}]}}}` + "\n"))
+		_, err = conn.Write([]byte(`{"id":"herdr-observr","result":{"type":"session_snapshot","snapshot":{"version":"0.9.0","protocol":22,"tabs":[{"tab_id":"w1:t1","workspace_id":"w1"}]}}}` + "\n"))
 		return err
 	})
 	t.Setenv("HERDR_SOCKET_PATH", sock)
