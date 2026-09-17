@@ -75,6 +75,20 @@ run correctly (Herdr injects it when the plugin starts the daemon itself). The
 OTLP endpoint comes from `OTEL_EXPORTER_OTLP_ENDPOINT` (defaults to
 collector:4317) and other standard `OTEL_*` env vars.
 
+`HERDR_PLUGIN_STATE_DIR` is where the daemon persists its generated machine
+UUID — the `machine-id` file read at startup into the `herdr.machine.id` OTLP
+resource attribute that rides on every exported datapoint. It is the dashboard's
+per-machine grouping/filter key: deliberately a plugin-persisted UUID, never the
+hostname (display-only) or Herdr's own ids (scoped to a single server), and
+stable across restarts by design. When Herdr starts the daemon itself it
+injects this variable for you, pointing at a per-plugin directory under Herdr's
+own state dir (e.g. `~/.local/state/herdr/plugins/nabutabu.herdr-observr`, or
+under `$XDG_STATE_HOME/herdr/...`), and creates it before launching — so
+plugin-installed runs need no extra setup at all. In standalone runs
+(`./bin/herdr-observr`), set it to a persistent directory of your own; if it's
+unset, the daemon logs a warning and omits `herdr.machine.id`, leaving your
+dashboard with no series grouped by machine.
+
 ## Release
 
 Every merge to `main` cuts a new release (`.github/workflows/release.yml`):
