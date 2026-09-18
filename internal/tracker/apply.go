@@ -367,6 +367,9 @@ func (t *Tracker) ApplySnapshot(snap snapshot.Snapshot) {
 		if pane.Agent != nil {
 			state.Agent = *pane.Agent
 		}
+		// Copy the pointer: each ApplySnapshot re-parses a fresh snapshot, so
+		// the pointed-to AgentSessionInfo is per-call and safe to alias.
+		state.AgentSession = pane.AgentSession
 		t.panes[pane.PaneID] = state
 
 		// Seed an agent record so post-bootstrap transitions have a prior

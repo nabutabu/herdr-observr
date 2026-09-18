@@ -933,6 +933,82 @@ func TestIdempotentApplySameEventSequence(t *testing.T) {
 	}
 }
 
+func TestApplySnapshotCarriesAgentSession(t *testing.T) {
+	tr := NewTracker()
+	sess := snapshot.AgentSessionInfo{
+		Source: "herdr:opencode",
+		Agent:  "opencode",
+		Kind:   snapshot.AgentSessionRefKindID,
+		Value:  "ses_4f7d2fae1c4b9a03",
+	}
+	tr.ApplySnapshot(snapshot.Snapshot{
+		Panes: []snapshot.Pane{{
+			PaneID: "w1:p1", WorkspaceID: "w1", TabID: "w1:t1",
+			AgentStatus: snapshot.AgentStatusWorking, Agent: &sess.Agent,
+			AgentSession: &sess,
+		}},
+	})
+
+	tr.mu.RLock()
+	pane, ok := tr.panes["w1:p1"]
+	tr.mu.RUnlock()
+	if !ok {
+		t.Fatal("pane w1:p1 not tracked")
+	}
+	if pane.AgentSession == nil {
+		t.Fatal("pane AgentSession = nil, want populated from snapshot")
+	}
+	if !reflect.DeepEqual(pane.AgentSession, &sess) {
+		t.Errorf("pane AgentSession = %+v, want %+v", pane.AgentSession, &sess)
+	}
+}
+
+func TestApplySnapshotUpdatesAgentSession(t *testing.T) {
+	// The session value is the "frontmost right now" attribution and can flip
+	// between sessions within one pane (PLAN.md U-finding). A re-baseline must
+	// replace it, not merge or preserve the stale value.
+	tr := NewTracker()
+	first := snapshot.AgentSessionInfo{Source: "herdr:opencode", Agent: "opencode", Kind: snapshot.AgentSessionRefKindID, Value: "ses_a"}
+	second := snapshot.AgentSessionInfo{Source: "herdr:opencode", Agent: "opencode", Kind: snapshot.AgentSessionRefKindID, Value: "ses_b"}
+	agent := "opencode"
+	tr.ApplySnapshot(snapshot.Snapshot{Panes: []snapshot.Pane{{
+		PaneID: "w1:p1", WorkspaceID: "w1", TabID: "w1:t1",
+		AgentStatus: snapshot.AgentStatusWorking, Agent: &agent, AgentSession: &first,
+	}}})
+	tr.ApplySnapshot(snapshot.Snapshot{Panes: []snapshot.Pane{{
+		PaneID: "w1:p1", WorkspaceID: "w1", TabID: "w1:t1",
+		AgentStatus: snapshot.AgentStatusWorking, Agent: &agent, AgentSession: &second,
+	}}})
+
+	tr.mu.RLock()
+	pane, ok := tr.panes["w1:p1"]
+	tr.mu.RUnlock()
+	if !ok {
+		t.Fatal("pane w1:p1 not tracked")
+	}
+	if pane.AgentSession == nil || pane.AgentSession.Value != "ses_b" {
+		t.Errorf("pane AgentSession.Value = %v, want ses_b", pane.AgentSession)
+	}
+}
+
+func TestEventCreatedPaneHasNoAgentSession(t *testing.T) {
+	// Pane.agent_status_changed events never carry agent_session (herdr
+	// src/api/schema/events.rs), so event-created panes must have nil
+	// attribution until the next snapshot re-baseline.
+	tr := NewTracker()
+	tr.ApplyPaneCreated(events.NormalizedEvent{PaneID: "w1:p1", WorkspaceID: "w1", TabID: "w1:t1"})
+
+	tr.mu.RLock()
+	pane, ok := tr.panes["w1:p1"]
+	tr.mu.RUnlock()
+	if !ok {
+		t.Fatal("pane w1:p1 not tracked")
+	}
+	if pane.AgentSession != nil {
+		t.Errorf("event-created pane AgentSession = %+v, want nil", pane.AgentSession)
+	}
+}
+
 // capturedState is a test helper that captures tracked state as a comparable struct.
 type capturedState struct {
 	Workspaces map[string]WorkspaceState

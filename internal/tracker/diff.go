@@ -45,6 +45,12 @@ func (r DiffReport) Empty() bool { return len(r.Drifts) == 0 && len(r.SeenFlips)
 // Membership drift is load-bearing now that tab.created/tab.closed are
 // subscribed (a missed tab.close event is a genuine event gap, same as a
 // missed pane.close), so a tab present in exactly one side is reported.
+//
+// AgentSession is deliberately excluded from pane comparison: the session
+// value flips between distinct sessions within one live pane (PLAN.md
+// U-finding), so including it would turn every reconcile into a spurious
+// drift and needless resubscribe. Session refs are attribution metadata that
+// self-heals at each ApplySnapshot re-baseline.
 func (t *Tracker) Diff(snap snapshot.Snapshot) DiffReport {
 	t.mu.RLock()
 	defer t.mu.RUnlock()

@@ -16,14 +16,22 @@ type WorkspaceState struct {
 }
 
 // PaneState is the tracker's record for one pane: identity, tab membership,
-// the agent currently holding it, and the agent status the tracker last saw.
+// the agent currently holding it, the agent status the tracker last saw, and
+// the pane's current agent_session attribution as reported by the snapshot.
 type PaneState struct {
 	PaneID      string
 	WorkspaceID string
 	TabID       string
 	Agent       string
 	Status      snapshot.AgentStatus
-	UpdatedAt   time.Time
+	// AgentSession is the wire agent_session attribution from the latest
+	// snapshot (nil when the pane has no agent session). It answers "which
+	// session is frontmost right now", not "which session has this pane run
+	// all along" — the value can flip between sessions in one pane, so it must
+	// not be treated as a stable pane↔session binding. Nil on event-created
+	// panes; only ApplySnapshot populates it.
+	AgentSession *snapshot.AgentSessionInfo
+	UpdatedAt    time.Time
 
 	// ClosedAt is set when the pane's close is applied (2.7). Non-zero means
 	// the pane is in the bounded-retention grace window: live tracking over,
