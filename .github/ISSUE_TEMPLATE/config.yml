@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Herdr upstream
+    url: https://github.com/herdrdev/herdr/issues
+    about: Issues and questions about Herdr itself (not herdr-observr) belong in the upstream repository.
+  - name: Discussions
+    url: https://github.com/nabutabu/herdr-observr/discussions
+    about: Open-ended questions, usage discussion, and ideas that aren't a concrete bug or feature request.
