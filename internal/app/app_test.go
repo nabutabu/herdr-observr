@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/nabutabu/herdr-observr/internal/config"
 	"github.com/nabutabu/herdr-observr/internal/events"
 	"github.com/nabutabu/herdr-observr/internal/otel"
 	"github.com/nabutabu/herdr-observr/internal/snapshot"
@@ -771,7 +772,7 @@ func TestCountGaugesEventDriven(t *testing.T) {
 	defer func() { _ = mp.Shutdown(context.Background()) }()
 
 	a := &App{telemetry: &Telemetry{meter: mp.Meter(otel.MeterName)}, tr: tracker.NewTracker()}
-	a.telemetry.registerCountGauges(a.tr.Counts)
+	a.telemetry.registerCountGauges(nil, a.tr.Counts)
 
 	// Drive the tracker through the same handleEvent path as production via
 	// status events spread across two workspaces.
@@ -869,11 +870,78 @@ func TestCountGaugesEventDriven(t *testing.T) {
 	}
 }
 
+func TestCountGaugesFlagDisablesWorkspaceSeries(t *testing.T) {
+	// 4.2 HERDR_OBSRVR_EMIT_PER_WORKSPACE_GAUGES=false must collapse the 3.6
+	// gauges to global-only datapoints and drop the 3.7 per-workspace gauge
+	// entirely — a cardinality opt-out for backends that reject the
+	// 5 x N_workspaces series footprint.
+	reader := metric.NewManualReader()
+	mp := otel.NewMeterProviderWithReader(reader, resource.NewSchemaless(attribute.String("service.name", "test")))
+	defer func() { _ = mp.Shutdown(context.Background()) }()
+
+	falsePtr := false
+	cfg := &config.Config{EmitPerWorkspaceGauges: &falsePtr}
+
+	a := &App{telemetry: &Telemetry{meter: mp.Meter(otel.MeterName)}, tr: tracker.NewTracker()}
+	a.telemetry.registerCountGauges(cfg, a.tr.Counts)
+
+	a.handleEvent(statusEv(snapshot.AgentStatusWorking))
+	a.handleEvent(events.NormalizedEvent{Kind: events.KindAgentStatusChanged, PaneID: "w1:p2", WorkspaceID: "w1", Agent: "codex", NewState: snapshot.AgentStatusBlocked})
+
+	var rm metricdata.ResourceMetrics
+	if err := reader.Collect(context.Background(), &rm); err != nil {
+		t.Fatalf("collect: %v", err)
+	}
+
+	active := findInt64GaugePoints(t, rm, otel.ActiveAgentsMetricName)
+	if len(active) != 1 {
+		t.Fatalf("active datapoints = %d, want only the global point", len(active))
+	}
+	if global, _ := gaugeValues(active); global != 1 {
+		t.Errorf("active global = %d, want 1", global)
+	}
+
+	blocked := findInt64GaugePoints(t, rm, otel.BlockedAgentsMetricName)
+	if len(blocked) != 1 {
+		t.Fatalf("blocked datapoints = %d, want only the global point", len(blocked))
+	}
+
+	// The 3.7 metric must not be registered at all: no datapoints to find.
+	if concurrent := findInt64GaugePoints(t, rm, otel.WorkspaceConcurrentMetricName); len(concurrent) != 0 {
+		t.Errorf("concurrent datapoints = %d, want 0 with flag off", len(concurrent))
+	}
+}
+
+func TestCountGaugesDefaultKeepsWorkspaceSeries(t *testing.T) {
+	// nil cfg (no plugin config file) must leave the pre-4.2 behavior intact:
+	// per-workspace datapoints on the 3.6 gauges and a 3.7 gauge present.
+	reader := metric.NewManualReader()
+	mp := otel.NewMeterProviderWithReader(reader, resource.NewSchemaless(attribute.String("service.name", "test")))
+	defer func() { _ = mp.Shutdown(context.Background()) }()
+
+	a := &App{telemetry: &Telemetry{meter: mp.Meter(otel.MeterName)}, tr: tracker.NewTracker()}
+	a.telemetry.registerCountGauges(nil, a.tr.Counts)
+
+	a.handleEvent(events.NormalizedEvent{Kind: events.KindAgentStatusChanged, PaneID: "w2:p1", WorkspaceID: "w2", Agent: "codex", NewState: snapshot.AgentStatusWorking})
+
+	var rm metricdata.ResourceMetrics
+	if err := reader.Collect(context.Background(), &rm); err != nil {
+		t.Fatalf("collect: %v", err)
+	}
+	active := findInt64GaugePoints(t, rm, otel.ActiveAgentsMetricName)
+	if len(active) != 2 {
+		t.Errorf("active datapoints with nil cfg = %d, want 2 (global + w2)", len(active))
+	}
+	if concurrent := findInt64GaugePoints(t, rm, otel.WorkspaceConcurrentMetricName); len(concurrent) != 1 {
+		t.Errorf("concurrent datapoints with nil cfg = %d, want 1 (w2)", len(concurrent))
+	}
+}
+
 func TestCountGaugesNoopWithoutTelemetry(t *testing.T) {
 	// Telemetry disabled (nil meter): registering the gauges must be a no-op,
 	// never a panic or block.
 	a := &App{tr: tracker.NewTracker()}
-	a.telemetry.registerCountGauges(a.tr.Counts)
+	a.telemetry.registerCountGauges(nil, a.tr.Counts)
 	a.tr.ApplyAgentStatusChanged(events.NormalizedEvent{Kind: events.KindAgentStatusChanged, PaneID: "w1:p1", WorkspaceID: "w1", Agent: "codex", NewState: snapshot.AgentStatusWorking})
 }
 

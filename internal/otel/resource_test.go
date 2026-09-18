@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/google/uuid"
+	"github.com/nabutabu/herdr-observr/internal/config"
 	"github.com/nabutabu/herdr-observr/internal/machineid"
 	"go.opentelemetry.io/otel/sdk/resource"
 )
@@ -208,3 +209,77 @@ func TestBuildResourceHostnameAlwaysPresent(t *testing.T) {
 		t.Errorf("herdr.machine.hostname = %q, want %q", got, expected)
 	}
 }
+
+// --- 4.2 config-file override tests ---
+
+func testConfig() *config.Config {
+	return &config.Config{OTLP: config.OTLP{}}
+}
+
+func TestBuildResourceConfigOverridesServiceName(t *testing.T) {
+	// 4.2 precedence: a service.name/OTEL_SERVICE_NAME set in the config .env
+	// must win over the process env and the default.
+	setCleanEnv(t)
+	t.Setenv("OTEL_SERVICE_NAME", "env-svc")
+	t.Setenv("OTEL_RESOURCE_ATTRIBUTES", "service.name=attrs-svc")
+
+	cfg := testConfig()
+	cfg.ServiceName = ptr("cfg-svc")
+	res, err := BuildResource(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("BuildResource: %v", err)
+	}
+	if got := ServiceName(res); got != "cfg-svc" {
+		t.Errorf("service.name = %q, want cfg-svc", got)
+	}
+}
+
+func TestBuildResourceConfigAttrOverridesEnvAttr(t *testing.T) {
+	// A config-file resource attribute must override the same key from the env.
+	setCleanEnv(t)
+	t.Setenv("OTEL_RESOURCE_ATTRIBUTES", "mode=env,shared=env")
+
+	cfg := testConfig()
+	cfg.ResourceAttributes = ptr("mode=cfg,shared=cfg")
+	res, err := BuildResource(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("BuildResource: %v", err)
+	}
+	m := attrMap(t, res)
+	if m["mode"] != "cfg" || m["shared"] != "cfg" {
+		t.Errorf("mode/shared = %q/%q, want cfg/cfg", m["mode"], m["shared"])
+	}
+}
+
+func TestBuildResourceMachineIDOverrideWins(t *testing.T) {
+	// HERDR_OBSRVR_MACHINE_ID from the config file beats even the persisted
+	// herdr.machine.id.
+	dir := t.TempDir()
+	setCleanEnv(t)
+	t.Setenv("HERDR_PLUGIN_STATE_DIR", dir)
+
+	cfg := testConfig()
+	cfg.MachineID = ptr("config-file-uuid")
+	res, err := BuildResource(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("BuildResource: %v", err)
+	}
+	got, _ := ResourceAttribute(res, machineIDKey)
+	if got != "config-file-uuid" {
+		t.Errorf("herdr.machine.id = %q, want the config-file override", got)
+	}
+}
+
+func TestBuildResourceNilConfigKeepsEnvBehavior(t *testing.T) {
+	setCleanEnv(t)
+	t.Setenv("OTEL_SERVICE_NAME", "env-svc")
+	res, err := BuildResource(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("BuildResource: %v", err)
+	}
+	if got := ServiceName(res); got != "env-svc" {
+		t.Errorf("service.name = %q, want env-svc", got)
+	}
+}
+
+func ptr[T any](v T) *T { return &v }

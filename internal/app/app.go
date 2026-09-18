@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/nabutabu/herdr-observr/internal/client"
+	"github.com/nabutabu/herdr-observr/internal/config"
 	"github.com/nabutabu/herdr-observr/internal/events"
 	"github.com/nabutabu/herdr-observr/internal/snapshot"
 	"github.com/nabutabu/herdr-observr/internal/tracker"
@@ -29,6 +30,11 @@ type App struct {
 	sub *events.Subscriber
 	tr  *tracker.Tracker
 
+	// cfg is the resolved 4.2 plugin config from HERDR_PLUGIN_CONFIG_DIR,
+	// threaded into telemetry (exporter options, machine-id override,
+	// cardinality flag). Nil means no config file: pure env-driven defaults.
+	cfg *config.Config
+
 	// scope is the live coverage of the current subscription: the pane IDs it
 	// scopes pane.agent_status_changed to, as returned by SubscribeFromSnapshot
 	// at the last (re)subscribe. All lifecycle events are kind-scoped and need
@@ -42,8 +48,14 @@ type App struct {
 	telemetry *Telemetry
 }
 
-func New() *App {
-	return &App{}
+// New returns an App. An optional plugin config (4.2) is attached when
+// present; nil keeps the pre-4.2 env-only behavior.
+func New(cfg ...*config.Config) *App {
+	a := &App{}
+	if len(cfg) > 0 {
+		a.cfg = cfg[0]
+	}
+	return a
 }
 
 // Run drives the process until ctx is cancelled or the subscription stream
@@ -51,7 +63,7 @@ func New() *App {
 func (a *App) Run(ctx context.Context) error {
 	// (3.1) Stand up the OTel SDK first so telemetry covers the whole
 	// process lifetime. Failures disable telemetry, never the subscription.
-	a.telemetry = NewTelemetry(ctx)
+	a.telemetry = NewTelemetry(ctx, a.cfg)
 	defer a.telemetry.Shutdown(context.Background())
 
 	if err := a.ping(ctx); err != nil {
@@ -75,7 +87,7 @@ func (a *App) Run(ctx context.Context) error {
 	// after bootstrap. a.tr.Counts binds the tracker pointer before the SDK's
 	// first collection (10s interval), so there is no race; the callback reads
 	// under the tracker's own lock.
-	a.telemetry.registerCountGauges(a.tr.Counts)
+	a.telemetry.registerCountGauges(a.cfg, a.tr.Counts)
 
 	// Reconciled diffs reach this callback (still running on the loop
 	// goroutine). It never touches `sub` — subscription teardown stays owned by

@@ -9,6 +9,7 @@ import (
 	"syscall"
 
 	"github.com/nabutabu/herdr-observr/internal/app"
+	"github.com/nabutabu/herdr-observr/internal/config"
 	"github.com/nabutabu/herdr-observr/internal/version"
 )
 
@@ -24,7 +25,14 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	if err := app.New().Run(ctx); err != nil {
+	// (4.2) Load the plugin's .env from HERDR_PLUGIN_CONFIG_DIR. A load error
+	// must never kill the daemon: warn and continue with env-only defaults.
+	cfg, err := config.Load()
+	if err != nil {
+		slog.Warn("plugin config load failed; using env defaults", "error", err)
+	}
+
+	if err := app.New(cfg).Run(ctx); err != nil {
 		slog.Error("fatal", "error", err)
 		os.Exit(1)
 	}

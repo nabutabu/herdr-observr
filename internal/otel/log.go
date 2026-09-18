@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/nabutabu/herdr-observr/internal/config"
 	"go.opentelemetry.io/otel/exporters/otlp/otlplog/otlploggrpc"
 	apilog "go.opentelemetry.io/otel/log"
 	"go.opentelemetry.io/otel/log/global"
@@ -64,9 +65,10 @@ const (
 //
 // The exporter reads its whole configuration from the environment (the same
 // OTEL_EXPORTER_OTLP_* variables as the metrics exporter; logs ride the
-// /v1/logs path of the same endpoint), so no endpoint plumbing is needed here.
-// WithInsecure pins the SDK to a plaintext local collector, mirroring
-// NewMeterProvider.
+// /v1/logs path of the same endpoint). A 4.2 plugin config file overrides the
+// keys it explicitly sets, exactly like the metrics path (see NewMeterProvider
+// and logOTLPOptions); logs TLS/insecure follow the same config-file-driven
+// rule.
 //
 // The gRPC connection is established lazily (grpc.NewClient): construction
 // never blocks or fails because the collector is unreachable — export batches
@@ -79,8 +81,8 @@ const (
 // an error (configuration-level failure only) should log and continue without
 // event telemetry rather than aborting the process — exactly the metrics
 // path's behavior.
-func NewLoggerProvider(ctx context.Context, res *resource.Resource) (apilog.LoggerProvider, func(context.Context) error, error) {
-	exporter, err := otlploggrpc.New(ctx, otlploggrpc.WithInsecure())
+func NewLoggerProvider(ctx context.Context, res *resource.Resource, cfg ...*config.Config) (apilog.LoggerProvider, func(context.Context) error, error) {
+	exporter, err := otlploggrpc.New(ctx, logOTLPOptions(firstConfig(cfg))...)
 	if err != nil {
 		return nil, nil, fmt.Errorf("creating OTLP gRPC logs exporter: %w", err)
 	}
@@ -109,4 +111,27 @@ func newLoggerProviderWithProcessor(processor log.Processor, res *resource.Resou
 // production code should use NewLoggerProvider.
 func NewLoggerProviderWithProcessor(processor log.Processor, res *resource.Resource) *log.LoggerProvider {
 	return newLoggerProviderWithProcessor(processor, res)
+}
+
+// logOTLPOptions is the logs analogue of metricOTLPOptions: exporter options
+// only for keys the 4.2 config file explicitly set, and the historical
+// plaintext WithInsecure() pin when there is no config.
+func logOTLPOptions(c *config.Config) []otlploggrpc.Option {
+	if c == nil {
+		return []otlploggrpc.Option{otlploggrpc.WithInsecure()}
+	}
+	var opts []otlploggrpc.Option
+	if c.OTLP.InsecureDefault() {
+		opts = append(opts, otlploggrpc.WithInsecure())
+	}
+	if c.OTLP.Endpoint != nil {
+		opts = append(opts, otlploggrpc.WithEndpoint(*c.OTLP.Endpoint))
+	}
+	if c.OTLP.Timeout != nil {
+		opts = append(opts, otlploggrpc.WithTimeout(*c.OTLP.Timeout))
+	}
+	if c.OTLP.Headers != nil {
+		opts = append(opts, otlploggrpc.WithHeaders(config.ParseHeaders(*c.OTLP.Headers)))
+	}
+	return opts
 }
