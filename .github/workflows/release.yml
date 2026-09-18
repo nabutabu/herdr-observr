@@ -1,39 +1,35 @@
-# Release pipeline for herdr-observr. Releases are opt-in — the merge queue
-# merging PRs into main never cuts a release. A release is kicked off by running
-# the "Release" workflow manually from the Actions tab (workflow_dispatch),
-# optionally pinning a version or letting it auto-bump the patch number. The
-# flow:
+# Release pipeline for herdr-observr. Triggers on every push to main:
 #
-#   1. Determines the next version:
-#        - workflow_dispatch: the version you typed, or an auto-bump of the
-#          patch number read from internal/version/version.go.
-#        - tag push (v*): fired by the dispatch run creating the tag — the tag
-#          itself is the version.
-#   2. On the dispatch path only: syncs the version into BOTH version.go and
-#      herdr-plugin.toml, commits with [skip ci], and pushes straight to main.
-#      Direct pushes to main are normally blocked by the main ruleset, but the
-#      github-actions integration has an "always" bypass there — humans still
-#      need a PR merged through the merge queue. Then it creates and pushes tag
-#      v<x.y.z>, which re-triggers this workflow on the tag-push event.
+#   1. Determines the next version. If the pushed commit hand-edited
+#      internal/version/version.go (a manual major/minor bump), the workflow
+#      uses that version as-is. Otherwise it auto-bumps the patch number.
+#      Either way it syncs that version into BOTH version.go and
+#      herdr-plugin.toml's `version` field, commits with [skip ci], and pushes.
+#   2. Tags v<x.y.z> and pushes the tag.
 #   3. Runs goreleaser to cross-compile binaries (linux/darwin x amd64/arm64),
-#      attach them to a GitHub Release, and push an updated Homebrew formula
-#      into Formula/ in this same repo (another [skip ci] direct push under the
-#      same bypass — no separate tap repo or PAT required).
+#      package them, attach them to a GitHub Release, and push an updated
+#      Homebrew formula into Formula/ in this same repo (using the default
+#      GITHUB_TOKEN — no separate tap repo or PAT required).
 
 name: Release
 
 on:
   push:
-    tags:
-      - "v*"
+    branches: [main]
+    # Docs/deploy-only changes must NOT cut a new binary release. paths-ignore
+    # skips this workflow only when *every* changed file matches, so a mixed
+    # code+docs commit still releases.
+    paths-ignore:
+      - "deploy/**"
+      - "*.md"
+      - "image.png"
+  # Manual escape hatch. If a merge commit accidentally carries a skip-CI
+  # marker (or anything else suppresses the auto-trigger), we can rerun the
+  # release flow against the current main without an empty no-op commit.
   workflow_dispatch:
-    inputs:
-      version:
-        description: "Exact version to release (e.g. 0.4.0). Leave blank to auto-bump the patch number."
-        required: false
 
-# Pushing the version bump, the brew formula, and the release tag all need write
-# access to the repo's contents.
+# Pushing the version bump and the brew formula back to main needs write access
+# to the repo's contents.
 permissions:
   contents: write
 
@@ -49,7 +45,9 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          # Full history so goreleaser sees prior tags for changelog generation.
+          # Full history so the workflow can inspect HEAD~1 for the "did this
+          # commit hand-edit version.go?" check, and so goreleaser sees prior
+          # tags for changelog generation.
           fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
 
@@ -58,60 +56,53 @@ jobs:
         with:
           go-version: stable
 
-      # The dispatch run (and the tag-push run it triggers) both need a git
-      # identity for the bump commit, the release tag, and the formula push.
+      # Set the git identity once for the whole job. Both the version-bump
+      # commit and the annotated release tag need it, and the bump step is
+      # skipped on a hand-edited (non-auto-bumped) release — so configuring it
+      # here keeps tagging working on every path.
       - name: Configure git identity
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-      # Dispatch: use the pinned input version, else auto-bump the patch number.
-      # Tag push: the tag name IS the version.
+      # Decide whether to auto-bump or accept a hand-edited version.
       - name: Determine version
         id: version
         run: |
           set -euo pipefail
 
-          if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]; then
-            INPUT_VERSION="${{ github.event.inputs.version }}"
-            if [[ -n "$INPUT_VERSION" ]]; then
-              echo "Using pinned version $INPUT_VERSION"
-              echo "version=$INPUT_VERSION"
-              echo "is_dispatch=true"
-              exit 0
-            fi
+          CURRENT=$(sed -nE 's/.*const Version = "([0-9]+\.[0-9]+\.[0-9]+)".*/\1/p' internal/version/version.go)
+          if [[ -z "$CURRENT" ]]; then
+            echo "Could not parse version from internal/version/version.go" >&2
+            exit 1
+          fi
 
-            CURRENT=$(sed -nE 's/.*const Version = "([0-9]+\.[0-9]+\.[0-9]+)".*/\1/p' internal/version/version.go)
-            if [[ -z "$CURRENT" ]]; then
-              echo "Could not parse version from internal/version/version.go" >&2
-              exit 1
-            fi
-
+          # If the pushed commit changed version.go, treat that as a manual
+          # major/minor bump and use the value as-is. Otherwise auto-bump patch.
+          if git diff --name-only HEAD~1..HEAD 2>/dev/null | grep -qx 'internal/version/version.go'; then
+            echo "Version was manually edited to $CURRENT — using as-is."
+            echo "version=$CURRENT"  >> "$GITHUB_OUTPUT"
+            echo "bumped=false"      >> "$GITHUB_OUTPUT"
+          else
             MAJOR=$(echo "$CURRENT" | cut -d. -f1)
             MINOR=$(echo "$CURRENT" | cut -d. -f2)
             PATCH=$(echo "$CURRENT" | cut -d. -f3)
             NEW="${MAJOR}.${MINOR}.$((PATCH + 1))"
             echo "Auto-bumping $CURRENT → $NEW"
-            echo "version=$NEW"
-            echo "is_dispatch=true"
-            exit 0
+            echo "version=$NEW" >> "$GITHUB_OUTPUT"
+            echo "bumped=true"  >> "$GITHUB_OUTPUT"
           fi
 
-          TAG="${GITHUB_REF#refs/tags/}"
-          VERSION="${TAG#v}"
-          echo "Releasing tagged version $VERSION"
-          echo "version=$VERSION"
-          echo "is_dispatch=false"
-
-      # Dispatch-only: sync the release version into BOTH files that carry it and
-      # push the commit straight to main (github-actions bypass on the main
-      # ruleset). [skip ci] stops the push from re-triggering workflows.
+      # Sync the release version into BOTH files that carry it and commit if
+      # anything changed:
       #   - internal/version/version.go (printed by `herdr-observr version`)
       #   - herdr-plugin.toml's `version` field (what herdr shows in the plugin
       #     install preview and `herdr plugin list`)
-      # The diff guard makes it a no-op when both files already match.
+      # This runs on both paths — the auto-bump (version.go was the old value)
+      # and a hand-edited version (version.go already new, but the manifest may
+      # still be stale). The diff guard makes it a no-op when both already
+      # match. The [skip ci] marker stops the push from re-triggering.
       - name: Sync version into version.go + manifest
-        if: steps.version.outputs.is_dispatch == 'true'
         run: |
           set -euo pipefail
           NEW="${{ steps.version.outputs.version }}"
@@ -127,10 +118,9 @@ jobs:
             git push origin HEAD:main
           fi
 
-      # Dispatch-only: create + push the tag. The tag push re-triggers this
-      # workflow on the push:tags path, which runs goreleaser below.
+      # Always create + push the tag (even when version was hand-edited — that's
+      # the whole point of accepting it as-is).
       - name: Tag release
-        if: steps.version.outputs.is_dispatch == 'true'
         run: |
           set -euo pipefail
           NEW="${{ steps.version.outputs.version }}"
