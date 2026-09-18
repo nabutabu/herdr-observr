@@ -1,0 +1,82 @@
+name: Bug report
+description: Report a bug in herdr-observr
+title: "[Bug]: "
+labels: ["bug", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to fill out this bug report. Please search
+        open and closed issues to make sure this hasn't already been reported.
+  - type: textarea
+    id: description
+    attributes:
+      label: Description
+      description: A clear and concise description of the bug.
+      placeholder: "What went wrong?"
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to reproduce
+      description: Steps to reproduce the behavior.
+      placeholder: |
+        1. Start herdr with herdr-observr registered as a startup plugin...
+        2. ...
+        3. Observe the failure
+      value: |
+        1.
+        2.
+        3.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      description: What did you expect to happen?
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: What actually happened? Include error messages and relevant logs.
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: herdr-observr version
+      description: Output of `herdr-observr version`, or the vX.Y.Z from the release you're running.
+    validations:
+      required: true
+  - type: input
+    id: herdr-version
+    attributes:
+      label: herdr version
+      description: Output of `herdr --version`.
+    validations:
+      required: false
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options:
+        - Linux
+        - macOS
+        - Other
+    validations:
+      required: false
+  - type: dropdown
+    id: pipeline
+    attributes:
+      label: Telemetry pipeline
+      description: Where is herdr-observr exporting telemetry to?
+      options:
+        - OTLP/gRPC (default)
+        - OTLP/HTTP
+        - Other / custom collector
+    validations:
+      required: false
