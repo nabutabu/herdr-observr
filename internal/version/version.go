@@ -6,4 +6,4 @@ package version
 // Version is the herdr-observr release version, printed by
 // `herdr-observr version`. Edit the major or minor by hand to cut a larger
 // release; the release workflow auto-bumps the patch on every push to main.
-const Version = "0.0.4"
+const Version = "0.0.5"
