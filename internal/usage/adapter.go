@@ -53,8 +53,9 @@ type UsageTotals struct {
 // UsageDelta is one session's accrued usage between two polls: current
 // cumulative totals minus the last-observed totals for that session (U1.2).
 // It is the collector's output, produced by diffing against its session_id ->
-// last-observed Total map; U3 builds a NormalizedUsageEvent from these and U4
-// exports them.
+// last-observed Total map, and it is the normalized usage form itself (U3.1):
+// U4 exports these deltas directly, attaching observed-time and
+// pane/workspace attribution at export time, not via a separate seam type.
 //
 // Fields are deltas by construction — never negative by design (a decrease is
 // treated as a source reset and re-seeds the cursor instead of emitting).

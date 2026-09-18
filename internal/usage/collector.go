@@ -74,9 +74,10 @@ func (c *UsageCollector) Register(a UsageAdapter) {
 	c.adapters[a.AgentType()] = a
 }
 
-// Deltas delivers accrued per-session usage as it is observed (U1.2). Phase U3
-// builds NormalizedUsageEvents from this channel; the app consumes it on its
-// event loop like the tracker's Transition/StateDuration channels.
+// Deltas delivers accrued per-session usage as it is observed (U1.2). This is
+// the normalized usage seam (U3.1): the app consumes it on its event loop like
+// the tracker's Transition/StateDuration channels and U4 exports each delta
+// directly.
 func (c *UsageCollector) Deltas() <-chan UsageDelta { return c.deltas }
 
 // emitDelta is a non-blocking send with drop-and-warn, matching the repo's
