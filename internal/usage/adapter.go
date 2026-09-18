@@ -50,6 +50,26 @@ type UsageTotals struct {
 	CacheWriteTokens int64
 }
 
+// UsageDelta is one session's accrued usage between two polls: current
+// cumulative totals minus the last-observed totals for that session (U1.2).
+// It is the collector's output, produced by diffing against its session_id ->
+// last-observed Total map; U3 builds a NormalizedUsageEvent from these and U4
+// exports them.
+//
+// Fields are deltas by construction — never negative by design (a decrease is
+// treated as a source reset and re-seeds the cursor instead of emitting).
+// Attribution (which pane/workspace last pointed at the session) is a U3/U4
+// concern and deliberately absent here.
+type UsageDelta struct {
+	SessionID        string
+	CostUSD          float64
+	InputTokens      int64
+	OutputTokens     int64
+	ReasoningTokens  int64
+	CacheReadTokens  int64
+	CacheWriteTokens int64
+}
+
 // UsageAdapter is the seam between herdr-observr and one assistant's storage.
 // Adapters are stateless: the collector owns all session_id -> last-seen
 // totals state, so an adapter carries nothing across PollUsage calls.

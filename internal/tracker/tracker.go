@@ -111,6 +111,20 @@ func (t *Tracker) Tabs() map[string]TabState {
 	return tabs
 }
 
+// Panes returns the tracked pane state as a shallow copy. Safe to call from
+// any goroutine; the usage collector snapshots it on each poll rather than
+// reading under the tracker lock. ClosedAt (grace-window) panes are included —
+// callers filter, since "currently open" depends on the consumer's semantics.
+func (t *Tracker) Panes() map[string]PaneState {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	panes := make(map[string]PaneState, len(t.panes))
+	for k, v := range t.panes {
+		panes[k] = v
+	}
+	return panes
+}
+
 // Agents returns the tracked agent state as a shallow copy. Safe to call from
 // any goroutine; phase 3 exporters snapshot it rather than reading under the
 // tracker lock.
