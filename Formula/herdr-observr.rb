@@ -5,21 +5,21 @@
 class HerdrObservr < Formula
   desc "herdr-observr — agent runtime health telemetry for herdr exported over OTLP."
   homepage "https://github.com/nabutabu/herdr-observr"
-  version "0.0.7"
+  version "0.0.8"
   license "MIT"
 
   on_macos do
     if Hardware::CPU.intel?
-      url "https://github.com/nabutabu/herdr-observr/releases/download/v0.0.7/herdr-observr_0.0.7_darwin_amd64.tar.gz"
-      sha256 "7927e504b2b9da3b82541bf223ff317e0f1bf1b9f9f7cea939957760041791a2"
+      url "https://github.com/nabutabu/herdr-observr/releases/download/v0.0.8/herdr-observr_0.0.8_darwin_amd64.tar.gz"
+      sha256 "a1215f6c708d08bf10a98e8cdf5f0e20fa8ff93b217e1186f0524fda40388166"
 
       define_method(:install) do
         bin.install "herdr-observr"
       end
     end
     if Hardware::CPU.arm?
-      url "https://github.com/nabutabu/herdr-observr/releases/download/v0.0.7/herdr-observr_0.0.7_darwin_arm64.tar.gz"
-      sha256 "bb147811a77928f1a4feaecf2babb7a66223850f836678557c1743bd72faf824"
+      url "https://github.com/nabutabu/herdr-observr/releases/download/v0.0.8/herdr-observr_0.0.8_darwin_arm64.tar.gz"
+      sha256 "8465426cefe919612af534a1cf3fcd2bfced6a1099b558fead4d1076a1ff3282"
 
       define_method(:install) do
         bin.install "herdr-observr"
@@ -29,15 +29,15 @@ class HerdrObservr < Formula
 
   on_linux do
     if Hardware::CPU.intel? && Hardware::CPU.is_64_bit?
-      url "https://github.com/nabutabu/herdr-observr/releases/download/v0.0.7/herdr-observr_0.0.7_linux_amd64.tar.gz"
-      sha256 "52922afd1f0557a569cda5f807cf6ca35eb8a3a3457ef97248bc8de5339d6a1f"
+      url "https://github.com/nabutabu/herdr-observr/releases/download/v0.0.8/herdr-observr_0.0.8_linux_amd64.tar.gz"
+      sha256 "38779a970c98f3324a1b3e01083cfa6f471a3a294725006892af8529825b3424"
       define_method(:install) do
         bin.install "herdr-observr"
       end
     end
     if Hardware::CPU.arm? && Hardware::CPU.is_64_bit?
-      url "https://github.com/nabutabu/herdr-observr/releases/download/v0.0.7/herdr-observr_0.0.7_linux_arm64.tar.gz"
-      sha256 "7c886b52a367b702f0879fc6b87e70b71f438e3fa9730cef3071101e834cd3f5"
+      url "https://github.com/nabutabu/herdr-observr/releases/download/v0.0.8/herdr-observr_0.0.8_linux_arm64.tar.gz"
+      sha256 "72cbe3fb83d72fc0ad21299d4bd49b07bebe5601ffada5ca2b7474a068c6a13f"
       define_method(:install) do
         bin.install "herdr-observr"
       end
