@@ -4,10 +4,12 @@ Agent runtime telemetry for Herdr exported over OpenTelemetry.
 
 A Herdr plugin (`herdr-plugin.toml`): a telemetry daemon subscribed to Herdr's
 live event stream that tracks agent runtime *health* — where agents are stuck,
-how long they wait for a human, how much concurrent work is happening — and
-exports it over OTLP to standard observability backends (Prometheus, Tempo,
-Grafana). Strict privacy constraint, non-negotiable: only lifecycle/state
-metadata (ids, states, timestamps) leaves the process, never pane/terminal
+how long they wait for a human, how much concurrent work is happening — plus
+per-session **usage & cost** (token consumption and USD spend for **opencode**
+agents) — and exports it over OTLP to standard observability backends
+(Prometheus, Tempo, Grafana). Strict privacy constraint, non-negotiable: only
+lifecycle/state metadata (ids, states, timestamps) and aggregated usage numbers
+(session ids, token/cost counters) leave the process, never pane/terminal
 content or agent transcripts.
 
 ## Requirements
@@ -73,7 +75,8 @@ HERDR_SOCKET_PATH=/path/to/your/herdr.sock ./bin/herdr-observr
 The socket path is read from `HERDR_SOCKET_PATH` and NEEDS to be set in order to
 run correctly (Herdr injects it when the plugin starts the daemon itself). The
 OTLP endpoint comes from `OTEL_EXPORTER_OTLP_ENDPOINT` (defaults to
-collector:4317) and other standard `OTEL_*` env vars.
+`http://localhost:4317` — the exporter is pinned to a plaintext local collector,
+`WithInsecure`) and other standard `OTEL_*` env vars.
 
 `HERDR_PLUGIN_STATE_DIR` is where the daemon persists its generated machine
 UUID — the `machine-id` file read at startup into the `herdr.machine.id` OTLP
@@ -88,6 +91,47 @@ plugin-installed runs need no extra setup at all. In standalone runs
 (`./bin/herdr-observr`), set it to a persistent directory of your own; if it's
 unset, the daemon logs a warning and omits `herdr.machine.id`, leaving your
 dashboard with no series grouped by machine.
+
+## Telemetry
+
+The daemon exports the following metric groups over OTLP (instrumentation scope
+`herdr-observr`, every datapoint carries `herdr.machine.id`):
+
+- **Agent runtime health** — `herdr.agent.state.transitions` (counter),
+  `herdr.agent.state.duration` and `herdr.agent.attention_latency`
+  (histograms), live state-count gauges
+  `herdr.agent.{active,blocked,idle,done,unknown}`, and per-workspace
+  concurrency `herdr.workspace.agent.concurrent`.
+- **Usage & cost (opencode)** — per-session counters
+  `herdr.session.cost.usd` and
+  `herdr.session.tokens.{input,output,reasoning,cache_read,cache_write,total}`,
+  each tagged with the durable session id and its last-known pane/workspace.
+
+### OpenCode usage tracking
+
+**Cost and usage tracking for opencode is now available.** The daemon polls
+opencode's own SQLite store (`opencode.db`) for each active pane's cumulative
+per-session totals and exports the observed *deltas* across the
+`herdr.session.*` counters:
+
+- The opencode adapter reads `$XDG_DATA_HOME/opencode/opencode.db` (falling back
+  to `~/.local/share/opencode/opencode.db` when `XDG_DATA_HOME` is unset), open
+  read-only, per poll.
+- Only the `session` row's numeric cost/token columns participate — the message
+  and part (content) tables are never read, preserving the privacy bar above.
+- Cost is exported as recorded by opencode itself: if your model/provider
+  reports zero cost, `herdr.session.cost.usd` stays at zero while the token
+  counters keep accruing.
+
+Notes:
+
+- Counters record usage accrued *since the daemon started* (per-process deltas,
+  re-seeded on restart), so query with `rate()`/`increase()`, never raw values.
+- When shipped through an OTLP→Prometheus collector, metric names are
+  translated per the OpenTelemetry spec: counters gain a `_total` suffix and
+  dimensionless gauges a `_ratio` suffix (e.g. `herdr.agent.active` →
+  `herdr_agent_active_ratio`, `herdr.session.cost.usd` →
+  `herdr_session_cost_usd_USD_total`).
 
 ## Release
 
@@ -119,13 +163,17 @@ findings.
 main.go                      # entrypoint: version subcommand, delegates to internal/app
 internal/app/                # process lifecycle: bootstrap snapshot → subscribe → event
                              #   loop → reconnect/resubscribe (reconciliation-driven and
-                             #   pane-coverage-driven) → teardown
+                             #   pane-coverage-driven) → usage collector + telemetry wiring
+                             #   → teardown
 internal/client/             # one-shot NDJSON RPC client over the Unix socket
 internal/events/             # scoped event subscription, dedicated-connection subscriber,
                              #   single-pass classify+normalize (nine Kind values)
 internal/snapshot/           # session.snapshot fetch/parse
 internal/tracker/            # state machine, duration/attention/concurrency accounting,
                              #   grace-window retention, periodic reconciliation (read-only)
+internal/usage/              # usage & cost collection: event-driven active-set
+                             #   polling (collector.go) + adapters/opencode (reads
+                             #   opencode.db read-only for cumulative per-session totals)
 internal/otel/               # OTLP/gRPC metrics, logs, traces providers + resource builder
 internal/machineid/          # persisted herdr.machine.id UUID
 internal/version/            # release version (synced by .github/workflows/release.yml)
