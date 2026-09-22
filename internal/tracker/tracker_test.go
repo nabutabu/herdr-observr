@@ -1507,12 +1507,25 @@ func TestApplyTabClosedCascadesPanesAndAgents(t *testing.T) {
 	}
 }
 
+// stubSockPath returns a Unix socket path short enough for macOS's 104-byte
+// sockaddr_un.sun_path limit. t.TempDir() embeds the full test name and can
+// alone exceed the limit on macOS runners, so use a short random-named dir.
+func stubSockPath(t *testing.T) string {
+	t.Helper()
+	dir, err := os.MkdirTemp("", "herdr-")
+	if err != nil {
+		t.Fatalf("MkdirTemp: %v", err)
+	}
+	t.Cleanup(func() { os.RemoveAll(dir) })
+	return filepath.Join(dir, "h.sock")
+}
+
 // startSnapshotStub runs a unix socket server that accepts connections, reads
 // one session.snapshot request, and answers with the JSON produced by respond.
 // Multiple connections are supported (each RPC opens its own).
 func startSnapshotStub(t *testing.T, respond func() string) string {
 	t.Helper()
-	sockPath := filepath.Join(t.TempDir(), "herdr-tracker-test.sock")
+	sockPath := stubSockPath(t)
 	ln, err := net.Listen("unix", sockPath)
 	if err != nil {
 		t.Fatalf("listen: %v", err)

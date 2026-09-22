@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
-	"path/filepath"
 	"reflect"
 	"testing"
 	"time"
@@ -111,7 +110,7 @@ func TestBuildParamsExcludesNoise(t *testing.T) {
 func TestSubscribeFromSnapshotReturnsSubscribedPaneIDs(t *testing.T) {
 	const snapshotBody = `{"type":"session_snapshot","snapshot":{"workspaces":[{"workspace_id":"w1"}],"tabs":[{"tab_id":"w1:t1","workspace_id":"w1","label":"agents"}],"panes":[{"pane_id":"w1:p1","workspace_id":"w1","tab_id":"w1:t1"},{"pane_id":"w1:p2","workspace_id":"w1","tab_id":"w1:t1"}]}}`
 
-	sockPath := filepath.Join(t.TempDir(), "herdr-subscribe-from-snapshot.sock")
+	sockPath := stubSockPath(t)
 	ln, err := net.Listen("unix", sockPath)
 	if err != nil {
 		t.Fatalf("listen: %v", err)

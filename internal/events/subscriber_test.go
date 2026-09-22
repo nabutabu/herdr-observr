@@ -47,9 +47,22 @@ func compareSubscriptions(got, want map[string]any) error {
 	return nil
 }
 
+// stubSockPath returns a Unix socket path short enough for macOS's 104-byte
+// sockaddr_un.sun_path limit. t.TempDir() embeds the full test name and can
+// alone exceed the limit on macOS runners, so use a short random-named dir.
+func stubSockPath(t *testing.T) string {
+	t.Helper()
+	dir, err := os.MkdirTemp("", "herdr-")
+	if err != nil {
+		t.Fatalf("MkdirTemp: %v", err)
+	}
+	t.Cleanup(func() { os.RemoveAll(dir) })
+	return filepath.Join(dir, "h.sock")
+}
+
 func startStubServer(t *testing.T, handler func(*bufio.Reader, net.Conn) error) (string, <-chan error) {
 	t.Helper()
-	sockPath := filepath.Join(t.TempDir(), "herdr-events-test.sock")
+	sockPath := stubSockPath(t)
 	ln, err := net.Listen("unix", sockPath)
 	if err != nil {
 		t.Fatalf("listen: %v", err)
