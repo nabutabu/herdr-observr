@@ -11,7 +11,7 @@
 id = "nabutabu.herdr-observr"
 name = "Herdr Observr"
 # Kept in sync with internal/version/version.go by .github/workflows/release.yml.
-version = "0.0.8"
+version = "0.0.9"
 description = "Observe all agents running on herdr through OTLP"
 min_herdr_version = "0.7.5"
 platforms = ["linux", "macos"]
