@@ -13,6 +13,8 @@ import (
 	"github.com/nabutabu/herdr-observr/internal/events"
 	"github.com/nabutabu/herdr-observr/internal/snapshot"
 	"github.com/nabutabu/herdr-observr/internal/tracker"
+	"github.com/nabutabu/herdr-observr/internal/usage"
+	"github.com/nabutabu/herdr-observr/internal/usage/adapters/opencode"
 )
 
 const maxInitialAttempts = 5
@@ -28,6 +30,13 @@ const evictInterval = 5 * time.Second
 type App struct {
 	sub *events.Subscriber
 	tr  *tracker.Tracker
+
+	// uc is the usage & cost collector (U1.2): it turns per-session cumulative
+	// totals from agent adapters into session-scoped usage deltas, driven off
+	// Tracker.Transitions() and the snapshot re-baselines rather than a
+	// full-pane poll. Nil until Run bootstraps; see the U1.2 wiring comment in
+	// Run for the three touch points.
+	uc *usage.UsageCollector
 
 	// scope is the live coverage of the current subscription: the pane IDs it
 	// scopes pane.agent_status_changed to, as returned by SubscribeFromSnapshot
@@ -76,6 +85,20 @@ func (a *App) Run(ctx context.Context) error {
 	// first collection (10s interval), so there is no race; the callback reads
 	// under the tracker's own lock.
 	a.telemetry.registerCountGauges(a.tr.Counts)
+
+	// Usage & cost telemetry (U1.2): construct against the tracker's live pane
+	// accessor, register the opencode source adapter, start the collector's own
+	// goroutine (same pattern as a.tr.Run below), THEN request the initial
+	// sync — Run must already be receiving on c.syncs for RequestSync's
+	// coalescing to have anywhere to go. (RequestSync itself never blocks even
+	// if called before Run starts, since the channel has capacity 1 — but
+	// starting Run first is the more obviously correct order and costs
+	// nothing.) The sync seeds already-working panes from this snapshot, which
+	// is also the only way they get activated: a pane whose first-ever status
+	// is `working` emits no transition.
+	a.uc = usage.NewUsageCollector(a.tr.Panes, opencode.New())
+	go a.uc.Run(ctx)
+	a.uc.RequestSync(a.tr.Panes())
 
 	// Reconciled diffs reach this callback (still running on the loop
 	// goroutine). It never touches `sub` — subscription teardown stays owned by
@@ -139,11 +162,21 @@ func (a *App) Run(ctx context.Context) error {
 			// herdr.agent.state.transitions counter; 3.8 additionally emits a
 			// herdr.agent.state_change event record and 3.9 a short
 			// herdr.agent.state_change span, both carrying the
-			// high-cardinality ids the counter excludes.
+			// high-cardinality ids the counter excludes. U1.2: the usage
+			// collector watches the same feed to start/stop polling the
+			// pane's cost/token totals (usage only moves while working).
 			a.telemetry.recordTransition(tr)
 			a.telemetry.recordTransitionEvent(tr)
 			a.telemetry.recordTransitionSpan(tr)
+			a.uc.NotifyTransition(tr)
 			slog.Debug("agent state change", "pane_id", tr.PaneID, "agent", tr.Agent, "previous", tr.Previous, "new", tr.New)
+
+		case d := <-a.uc.Deltas():
+			// U1.2/U4.1: export usage deltas as OTel telemetry. Placeholder
+			// until the exporter step lands; logged for now so the
+			// event-driven path is observable end to end.
+			slog.Debug("usage delta", "session_id", d.SessionID, "cost_usd", d.CostUSD,
+				"input_tokens", d.InputTokens, "output_tokens", d.OutputTokens)
 
 		case sd := <-a.tr.StateDurations():
 			// 3.4: every closed state interval records one
@@ -240,6 +273,12 @@ func (a *App) reconnect(ctx context.Context) {
 		a.sub = next
 		a.scope = newScope(paneIDs)
 		a.tr.ApplySnapshot(resp.Snapshot)
+		// U1.2: re-seed the usage collector from the re-baselined snapshot so
+		// panes that started or stopped working while disconnected are caught.
+		// Safe here purely because RequestSync is a channel handoff — Run's
+		// goroutine (alive since bootstrap) applies it — never a direct map
+		// mutation that would race it.
+		a.uc.RequestSync(a.tr.Panes())
 	}
 }
 

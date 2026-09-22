@@ -52,7 +52,8 @@ full local demo stack were all already merged). The house rule:
   package and its `_test.go` file — and, for anything meant to run in
   production, also check whether it's actually *wired into* `main.go`/
   `internal/app`. A package can be fully implemented and tested and still be
-  dead code if nothing calls it (see the Usage/cost telemetry note below).
+  dead code if nothing calls it (the usage collector was exactly that until
+  U1.2 wired it into `App.Run`).
 - **Consult the real Herdr source, not memory.** When deciding any object
   shape, event payload, RPC behavior, or structure received from the Herdr
   socket, always refer to the actual Herdr project at
@@ -249,15 +250,18 @@ internal/tracker/
 internal/machineid/
   machineid.go                 # LoadOrCreate: persisted herdr.machine.id UUID under
                                 #   HERDR_PLUGIN_STATE_DIR (finding #7)
-internal/usage/                # Usage/cost telemetry (U-plan). BUILT AND TESTED BUT NOT WIRED
-  adapter.go                   #   into App.Run or main.go — see "Not yet implemented" below
-                                #   before assuming any of this runs in the shipped binary.
-  collector.go                 # UsageCollector: polls tracker.Panes() on an interval, dispatches
-                                #   each pane's agent_session to the adapter registered for its
-                                #   agent type, diffs cumulative totals into UsageDelta, keyed by
-                                #   session id (never pane — finding #10). U4.1 resolves each
-                                #   delta's pane/workspace/agent tags via tracker.Sessions()
-                                #   (U3.2), not from the delta itself.
+internal/usage/                # Usage/cost telemetry (U-plan). WIRED since U1.2 (event-driven);
+  adapter.go                   #   runs in the shipped binary (construct + start + RequestSync in
+                                #   App.Run, NotifyTransition from the event loop, Deltas() consumed
+                                #   as a debug log until U4.1 export lands).
+  collector.go                 # UsageCollector: event-driven active-pane set. Drives polling off
+                                #   Tracker.Transitions() (NotifyTransition) + snapshot re-baselines
+                                #   (RequestSync) + a self-heal reconcile scan — never a full-pane
+                                #   poll. Dispatches each active pane's agent_session to the adapter
+                                #   registered for its agent type, diffs cumulative totals into
+                                #   UsageDelta, keyed by session id (never pane — finding #10). U4.1
+                                #   resolves each delta's pane/workspace/agent tags via
+                                #   tracker.Sessions() (U3.2), not from the delta itself.
   adapters/opencode/opencode.go# OpencodeAdapter: reads opencode.db's session row (cost + 5 token
                                 #   counters) read-only; never touches the message table
 internal/version/version.go    # release version, synced by .github/workflows/release.yml
@@ -311,14 +315,13 @@ Ownership rules embedded in this structure — preserve them when extending:
   created after the last subscribe, which is exactly the gap `scope`
   detects).
 - **`internal/usage`** follows the same single-owner-goroutine idiom as
-  `Tracker`/`Subscriber` (register adapters before `Run`, then only the
-  collector's own goroutine touches `cursors`/`adapters`) — but nothing in
-  `internal/app` currently constructs a `UsageCollector`, registers the
-  `opencode` adapter, or starts `Run`/consumes `Deltas()`. Treat this
-  package as a correctly-built, fully-tested library with no caller yet,
-  not as a running feature — `go.mod` even lists `modernc.org/sqlite` as a
-  direct (non-indirect) dependency purely to compile it in, even though the
-  shipped binary never calls it at runtime.
+  `Tracker`/`Subscriber`. Everything reaches the collector through channel
+  handoffs — `NotifyTransition` and `RequestSync` are non-blocking sends from
+  the app's event loop, and only the collector's own `Run` goroutine touches
+  `active`/`cursors`/`adapters` (that indirection is what lets `reconnect`'s
+  `RequestSync` be safe while `Run` is live; a direct call would race it).
+  `modernc.org/sqlite` is a direct dependency because the `opencode` adapter
+  runs in the shipped binary since U1.2 — no longer a compile-only-inclusion.
 
 ## Phase status (do not trust this section blindly — cross-check the tree)
 
@@ -330,8 +333,8 @@ the manifest/build script and the full `deploy/` demo stack were already
 merged. Treat every line below as a claim to spot-check against the actual
 package and its `_test.go` file, not as ground truth — and for anything
 described as "implemented," also check whether it's reachable from
-`main.go` (see the Usage/cost telemetry item below for why that second
-check matters).
+`main.go` (the usage collector was the cautionary example that the second
+check exists for).
 
 Implemented and tested, as of the current `main` branch:
 
@@ -356,6 +359,18 @@ Implemented and tested, as of the current `main` branch:
   `internal/app/scope.go` plus `app.paneCreatedNeedsResubscribe`. A pane
   created after the last subscribe triggers an immediate resubscribe
   instead of waiting for the next reconcile tick.
+- **U1.2 (Usage & cost collector, event-driven revision)** — polling is
+  driven off `Tracker.Transitions()` plus snapshot re-baselines, never a
+  full-pane scan: the collector keeps an `active` set of working panes
+  (immediate poll on transition-in, one trailing poll on transition-out),
+  `RequestSync` seeds already-working panes at bootstrap/after every
+  reconnect (coalesced channel handoff, safe while `Run` is live), and a
+  minute-scoped self-heal reconcile scan catches first-seen-at-working
+  panes that emit no transition. Close-eviction drops a closed-while-
+  working pane from `active` (close fires no transition). Wired into
+  `App.Run` since U1.2: constructed with the `opencode` adapter, started
+  once, `NotifyTransition` from the event loop, `Deltas()` consumed as a
+  debug log pending U4.1 export (see "Not yet implemented").
 - **2.1–2.3** — state machine, per-agent state struct, and
   duration-by-state accounting (`tracker.AgentState`,
   `ApplyAgentStatusChanged`)
@@ -460,17 +475,12 @@ Implemented and tested, as of the current `main` branch:
   *within* a running process — it does not protect against the process
   itself crashing, or against the process giving up after its own ~31s
   initial-connection budget (finding #1). This is the top open item.
-- **Usage/cost telemetry (the U-plan)** — `internal/usage` (collector +
-  adapter interface) and `internal/usage/adapters/opencode` are fully
-  implemented and unit-tested, but **nothing in `internal/app` or `main.go`
-  constructs a `UsageCollector`, registers the `opencode` adapter, or
-  consumes `Deltas()`.** No cost/token telemetry leaves the process today
-  regardless of configuration. Wiring this up is small (construct the
-  collector off `a.tr.Panes`, register `opencode.New()`, start
-  `go c.Run(ctx)`, add a `case d := <-c.Deltas():` to `App.Run`'s select —
-  same shape as the tracker's channels) and is the highest-value next step
-  since the hard part (the adapter, the session-id-keyed diffing in finding
-  #10) is already done and tested.
+- **U4.1 (usage export)** — the U1.2 collector now runs in the shipped
+  binary (constructed/started at bootstrap, `NotifyTransition` from the
+  event loop, `RequestSync` on every re-baseline), but `App.Run` consumes
+  `Deltas()` as a debug log only — nothing exports usage deltas as OTel
+  telemetry yet. Export is small (resolve each delta's tags via
+  `tracker.Sessions()` per U3.2 and record it in `internal/otel`).
 - **Phase 5 (reliability hardening)** — no dedicated stress test yet for
   the crash-loop/backoff ceiling (5.1, moot until 1.2 exists), the
   socket-unavailable-at-startup race (5.2 — `subscribeWithBackoff` retries,
@@ -527,7 +537,8 @@ Implemented and tested, as of the current `main` branch:
   go.
 - **Built ≠ running.** Before describing a package as "done," check that
   something in `internal/app`/`main.go` actually calls it. `internal/usage`
-  is the cautionary example: complete, tested, and inert.
+  was the cautionary example — complete, tested, and inert — until U1.2
+  wired it into `App.Run`.
 
 ## Testing
 
@@ -554,10 +565,11 @@ tests).
 Usage-collector tests (`internal/usage/collector_test.go`,
 `internal/usage/adapters/opencode/opencode_test.go`) follow the same
 pattern one layer further down: a fixture SQLite file for the opencode
-adapter, and a fake `panes`/adapter pair for the collector's diff logic.
-These are real, useful tests of code that isn't reachable in production yet
-— see the Usage/cost telemetry item above before assuming test coverage
-implies the feature runs.
+adapter, and a fake `panes`/adapter pair for the collector's diff logic
+(now driven synchronously through `pollPane` for the diff-semantics tests,
+with the async channel paths exercised through a live `Run` and
+`select`-with-timeout call-count waits). These are real, useful tests of
+code that runs in the shipped binary since U1.2.
 
 Live-instance verification (anything under "Verify over trust" above)
 happens separately, via spike binaries against `HERDR_SOCKET_PATH` pointed
