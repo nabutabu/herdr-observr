@@ -229,13 +229,19 @@ internal/otel/
   trace.go                     # NewTracerProvider: OTLP/gRPC traces exporter + batch span processor
                                 #   (3.9), TracerName const; short root herdr.agent.state_change spans
 internal/tracker/
-  tracker.go                   # Tracker: mutex-guarded workspaces/tabs/panes/agents maps.
-                                #   Per-kind ApplyWorkspaceCreated/.../ApplyAgentStatusChanged/
+  tracker.go                   # Tracker: mutex-guarded workspaces/tabs/panes/agents maps, plus
+                                #   the U3.2 session→attribution index (sessions, keyed by the
+                                #   agent_session Value — never by pane). Per-kind
+                                #   ApplyWorkspaceCreated/.../ApplyAgentStatusChanged/
                                 #   ApplySeenFlip (steady-state writers), ApplySnapshot
-                                #   (bootstrap/re-baseline), Diff/DiffReport (read-only
-                                #   comparison, including tab membership and the done→idle
-                                #   seen-flip distinction), Run (periodic reconcile loop),
-                                #   close helpers + EvictExpired (2.7 grace-window cleanup)
+                                #   (bootstrap/re-baseline — the *only* writer of the sessions
+                                #   map, rebuilt wholesale so vanished sessions self-prune),
+                                #   Diff/DiffReport (read-only comparison, including tab
+                                #   membership and the done→idle seen-flip distinction),
+                                #   Run (periodic reconcile loop), close helpers + EvictExpired
+                                #   (2.7 grace-window cleanup) — the sessions map is excluded
+                                #   from EvictExpired: it is pure last-known attribution, no
+                                #   phantom/leak risk, rebuilt on every re-baseline.
   counts.go                    # AgentCounts, Tracker.Counts(): live per-state agent counts,
                                 #   global and per-workspace, maintained incrementally
                                 #   (incrStateLocked/decrStateLocked) — feeds Phase 3's
@@ -249,7 +255,9 @@ internal/usage/                # Usage/cost telemetry (U-plan). BUILT AND TESTED
   collector.go                 # UsageCollector: polls tracker.Panes() on an interval, dispatches
                                 #   each pane's agent_session to the adapter registered for its
                                 #   agent type, diffs cumulative totals into UsageDelta, keyed by
-                                #   session id (never pane — finding #10)
+                                #   session id (never pane — finding #10). U4.1 resolves each
+                                #   delta's pane/workspace/agent tags via tracker.Sessions()
+                                #   (U3.2), not from the delta itself.
   adapters/opencode/opencode.go# OpencodeAdapter: reads opencode.db's session row (cost + 5 token
                                 #   counters) read-only; never touches the message table
 internal/version/version.go    # release version, synced by .github/workflows/release.yml

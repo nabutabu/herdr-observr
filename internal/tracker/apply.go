@@ -330,6 +330,12 @@ func (t *Tracker) ApplySeenFlip(paneID string) {
 // when the event stream may have a gap. After this, the stream owns the state
 // until the next re-bootstrap.
 //
+// It also rebuilds the session→attribution index (U3.2) wholesale from the
+// snapshot's panes: the snapshot is the only source of agent_session on the
+// wire (events never carry it), so the map is re-derived here — never patched
+// by event paths — and every re-baseline both refreshes current attributions
+// and prunes sessions that vanished from all panes.
+//
 // A re-baseline must not restart clocks for agents whose status is unchanged:
 // a pane sitting in `done` across a resubscribe (which can be triggered by an
 // unrelated drift) would otherwise truncate its attention-latency interval to
@@ -354,6 +360,7 @@ func (t *Tracker) ApplySnapshot(snap snapshot.Snapshot) {
 	clear(t.tabs)
 	clear(t.panes)
 	clear(t.agents)
+	clear(t.sessions)
 	t.resetCountsLocked()
 
 	for _, ws := range snap.Workspaces {
@@ -371,6 +378,25 @@ func (t *Tracker) ApplySnapshot(snap snapshot.Snapshot) {
 		// the pointed-to AgentSessionInfo is per-call and safe to alias.
 		state.AgentSession = pane.AgentSession
 		t.panes[pane.PaneID] = state
+
+		// Seed the session→attribution index (U3.2) from the pane's current
+		// frontmost session. Keyed by the agent_session Value — never by pane.
+		// ApplySnapshot is the only writer, and each re-baseline rebuilds the
+		// map wholesale, so a session that vanished from every pane self-prunes.
+		if pane.AgentSession != nil {
+			agentType := ""
+			if pane.Agent != nil {
+				agentType = *pane.Agent
+			} else {
+				agentType = pane.AgentSession.Agent
+			}
+			t.sessions[pane.AgentSession.Value] = SessionAttribution{
+				PaneID:      pane.PaneID,
+				WorkspaceID: pane.WorkspaceID,
+				TabID:       pane.TabID,
+				AgentType:   agentType,
+			}
+		}
 
 		// Seed an agent record so post-bootstrap transitions have a prior
 		// state to close out a duration against.

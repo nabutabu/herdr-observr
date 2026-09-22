@@ -25,6 +25,17 @@ type Tracker struct {
 	panes      map[string]PaneState
 	agents     map[string]AgentState
 
+	// sessions is the session→attribution index (U3.2): agent session
+	// identity -> the pane/workspace/tab it was last seen frontmost in, plus
+	// its agent type. Keyed by the agent_session Value (different key space
+	// from the pane-keyed maps above — a pane can host many sessions over its
+	// life). Populated only by ApplySnapshot (events never carry agent_session),
+	// which rebuilds it wholesale on every re-baseline so vanished sessions
+	// self-prune. Pure last-known attribution: stale entries are acceptable
+	// (U4.1 tags resolve against this, and a miss exports untagged), and no
+	// grace-window eviction is needed since there is no phantom/leak risk.
+	sessions map[string]SessionAttribution
+
 	// stateCounts and workspaceStateCounts maintain the live per-state agent
 	// counts (2.6), updated incrementally on every transition and recomputed
 	// wholesale by ApplySnapshot. Phase 3.6/3.7 read them via Counts().
@@ -73,6 +84,7 @@ func NewTracker() *Tracker {
 		tabs:                 map[string]TabState{},
 		panes:                map[string]PaneState{},
 		agents:               map[string]AgentState{},
+		sessions:             map[string]SessionAttribution{},
 		attentionLatency:     make(chan AttentionLatency, 64),
 		transitions:          make(chan AgentTransition, 64),
 		stateDuration:        make(chan StateDuration, 64),
@@ -136,6 +148,22 @@ func (t *Tracker) Agents() map[string]AgentState {
 		agents[k] = v
 	}
 	return agents
+}
+
+// Sessions returns the session→attribution index as a shallow copy. Safe to
+// call from any goroutine; U4.1 resolves each UsageDelta's SessionID against
+// it to attach pane/workspace/agent tags at export time. The map is last-known
+// attribution only — an entry may be absent (session never observed in a
+// snapshot) or stale (its pane later flipped sessions), and both cases are
+// handled by the caller, never this accessor.
+func (t *Tracker) Sessions() map[string]SessionAttribution {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	sessions := make(map[string]SessionAttribution, len(t.sessions))
+	for k, v := range t.sessions {
+		sessions[k] = v
+	}
+	return sessions
 }
 
 func (t *Tracker) emitAttentionLatency(al AttentionLatency) {

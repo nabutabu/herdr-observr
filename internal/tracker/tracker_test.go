@@ -1652,3 +1652,175 @@ func TestRunsStopsOnCancel(t *testing.T) {
 		t.Fatal("Run did not stop after context cancellation")
 	}
 }
+
+// sessionPane builds a snapshot pane carrying the given agent_session and
+// optional held-agent type.
+func sessionPane(paneID, workspaceID, tabID, agentType, sessionValue string) snapshot.Pane {
+	p := snapshot.Pane{
+		PaneID: paneID, WorkspaceID: workspaceID, TabID: tabID,
+		AgentStatus: snapshot.AgentStatusWorking,
+		AgentSession: &snapshot.AgentSessionInfo{
+			Source: "herdr:opencode",
+			Agent:  "opencode",
+			Kind:   snapshot.AgentSessionRefKindID,
+			Value:  sessionValue,
+		},
+	}
+	if agentType != "" {
+		p.Agent = &agentType
+	}
+	return p
+}
+
+// TestApplySnapshotSeedsSessionAttribution verifies U3.2's core: ApplySnapshot
+// indexes each session-bearing pane's durable session identity (the
+// agent_session Value, never the pane) to its pane/workspace/tab/agent-type
+// attribution — the map U4.1 resolves UsageDelta tags from.
+func TestApplySnapshotSeedsSessionAttribution(t *testing.T) {
+	tr := NewTracker()
+	tr.ApplySnapshot(snapshot.Snapshot{Panes: []snapshot.Pane{
+		sessionPane("w1:p1", "w1", "w1:t1", "opencode", "ses_1"),
+		sessionPane("w1:p2", "w1", "w1:t2", "codex", "ses_2"),
+	}})
+
+	sessions := tr.Sessions()
+	if len(sessions) != 2 {
+		t.Fatalf("sessions = %+v, want 2 entries", sessions)
+	}
+	att := sessions["ses_1"]
+	if att.PaneID != "w1:p1" || att.WorkspaceID != "w1" || att.TabID != "w1:t1" || att.AgentType != "opencode" {
+		t.Errorf("attribution for ses_1 = %+v", att)
+	}
+	att = sessions["ses_2"]
+	if att.PaneID != "w1:p2" || att.AgentType != "codex" {
+		t.Errorf("attribution for ses_2 = %+v", att)
+	}
+}
+
+// TestApplySnapshotSkipsPanesWithoutSession verifies panes with no
+// agent_session contribute no index entries — the accepted gap from the
+// U-plan (panes without Herdr session integration get no usage tracking).
+func TestApplySnapshotSkipsPanesWithoutSession(t *testing.T) {
+	tr := NewTracker()
+	agent := "opencode"
+	tr.ApplySnapshot(snapshot.Snapshot{Panes: []snapshot.Pane{{
+		PaneID: "w1:p1", WorkspaceID: "w1", TabID: "w1:t1",
+		AgentStatus: snapshot.AgentStatusWorking, Agent: &agent,
+	}}})
+
+	if sessions := tr.Sessions(); len(sessions) != 0 {
+		t.Errorf("nil-session pane produced index entries: %+v", sessions)
+	}
+}
+
+// TestApplySnapshotSessionAgentTypeFallsBackToSessionAgent verifies the
+// attribution's AgentType falls back to the session's own agent type when the
+// pane's agent isn't detected yet — matching the collector's dispatch fallback.
+func TestApplySnapshotSessionAgentTypeFallsBackToSessionAgent(t *testing.T) {
+	tr := NewTracker()
+	tr.ApplySnapshot(snapshot.Snapshot{Panes: []snapshot.Pane{
+		sessionPane("w1:p1", "w1", "w1:t1", "", "ses_1"),
+	}})
+
+	att, ok := tr.Sessions()["ses_1"]
+	if !ok {
+		t.Fatal("ses_1 missing from index")
+	}
+	if att.AgentType != "opencode" {
+		t.Errorf("AgentType = %q, want opencode (session fallback)", att.AgentType)
+	}
+}
+
+// TestApplySnapshotRebaselinePrunesVanishedSessions verifies a re-baseline
+// rebuilds the index wholesale: a session absent from the new snapshot drops
+// out rather than lingering as a stale attribution.
+func TestApplySnapshotRebaselinePrunesVanishedSessions(t *testing.T) {
+	tr := NewTracker()
+	tr.ApplySnapshot(snapshot.Snapshot{Panes: []snapshot.Pane{
+		sessionPane("w1:p1", "w1", "w1:t1", "opencode", "ses_1"),
+		sessionPane("w1:p2", "w1", "w1:t2", "opencode", "ses_2"),
+	}})
+	if len(tr.Sessions()) != 2 {
+		t.Fatal("expected two sessions after first baseline")
+	}
+
+	tr.ApplySnapshot(snapshot.Snapshot{Panes: []snapshot.Pane{
+		sessionPane("w1:p1", "w1", "w1:t1", "opencode", "ses_1"),
+	}})
+
+	sessions := tr.Sessions()
+	if len(sessions) != 1 {
+		t.Fatalf("sessions after re-baseline = %+v, want only ses_1", sessions)
+	}
+	if _, still := sessions["ses_2"]; still {
+		t.Error("vanished session survived the re-baseline")
+	}
+}
+
+// TestSessionsReturnsDefensiveCopy verifies the Sessions() accessor snapshots
+// the index like Panes()/Tabs()/Agents(): mutating the returned map must not
+// reach into the tracker.
+func TestSessionsReturnsDefensiveCopy(t *testing.T) {
+	tr := NewTracker()
+	tr.ApplySnapshot(snapshot.Snapshot{Panes: []snapshot.Pane{
+		sessionPane("w1:p1", "w1", "w1:t1", "opencode", "ses_1"),
+	}})
+
+	got := tr.Sessions()
+	delete(got, "ses_1")
+	got["bogus"] = SessionAttribution{PaneID: "x"}
+
+	if len(tr.Sessions()) != 1 {
+		t.Error("mutating the returned copy leaked into the tracker")
+	}
+	if _, ok := tr.Sessions()["ses_1"]; !ok {
+		t.Error("ses_1 missing from the real index after copy mutation")
+	}
+}
+
+// TestSessionIndexUnaffectedByEventPaths pins the single-writer contract:
+// only ApplySnapshot writes the index. Event paths that update pane agent and
+// status, and even pane close, must leave it untouched — it is re-derived, not
+// patched, so it never drifts from the snapshot truth mid-baseline.
+func TestSessionIndexUnaffectedByEventPaths(t *testing.T) {
+	tr := NewTracker()
+	tr.ApplySnapshot(snapshot.Snapshot{Panes: []snapshot.Pane{
+		sessionPane("w1:p1", "w1", "w1:t1", "opencode", "ses_1"),
+	}})
+
+	tr.ApplyAgentDetected(events.NormalizedEvent{PaneID: "w1:p1", Agent: "codex"})
+	tr.ApplyAgentStatusChanged(events.NormalizedEvent{PaneID: "w1:p1", WorkspaceID: "w1", Agent: "codex", NewState: snapshot.AgentStatusBlocked})
+	tr.ApplyPaneClosed(events.NormalizedEvent{PaneID: "w1:p1"})
+
+	sessions := tr.Sessions()
+	if len(sessions) != 1 {
+		t.Fatalf("event paths changed the index: %+v", sessions)
+	}
+	att := sessions["ses_1"]
+	if att.PaneID != "w1:p1" || att.WorkspaceID != "w1" {
+		t.Errorf("attribution mutated by event path = %+v", att)
+	}
+	// AgentType is snapshot-derived; an event-path agent rename must not leak
+	// into the index (it self-heals at the next re-baseline).
+	if att.AgentType != "opencode" {
+		t.Errorf("AgentType = %q, want opencode (event path must not write the index)", att.AgentType)
+	}
+}
+
+// TestSessionIndexSameSessionInTwoPanesLastWins pins the tie-break when one
+// session value is frontmost in two panes in the same snapshot: the pane later
+// in the slice is the last writer. Documented as benign — duplicate frontmost
+// sessions are a transient curiosity, and either winner still carries usable
+// attribution.
+func TestSessionIndexSameSessionInTwoPanesLastWins(t *testing.T) {
+	tr := NewTracker()
+	tr.ApplySnapshot(snapshot.Snapshot{Panes: []snapshot.Pane{
+		sessionPane("w1:p1", "w1", "w1:t1", "opencode", "ses_1"),
+		sessionPane("w1:p2", "w2", "w2:t1", "codex", "ses_1"),
+	}})
+
+	att := tr.Sessions()["ses_1"]
+	if att.PaneID != "w1:p2" || att.AgentType != "codex" {
+		t.Errorf("attribution = %+v, want last-writer pane w1:p2/codex", att)
+	}
+}

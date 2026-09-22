@@ -91,6 +91,22 @@ type AgentState struct {
 	ClosedAt time.Time
 }
 
+// SessionAttribution is the last-known location of one agent session: the
+// pane/workspace/tab it was frontmost in and the agent type, as observed by
+// the latest snapshot. Deliberately last-known, not live — a pane can flip
+// sessions, and a session can outlive the pane that first exposed it (PLAN.md
+// U-finding: agent_session is "frontmost right now", not a stable pane↔session
+// binding). Keyed by the agent_session Value (the session id for Kind "id", a
+// session directory path for Kind "path"); the Value is the durable identity
+// and must never be exported as a telemetry attribute — path-kind values in
+// particular are internal (snapshot.go privacy note).
+type SessionAttribution struct {
+	PaneID      string
+	WorkspaceID string
+	TabID       string
+	AgentType   string // the pane's agent type; "" when the pane's agent isn't detected yet
+}
+
 // AgentTransition is one observed change from one tracked agent state to
 // another — a genuine status change (2.3), whether event-driven
 // (ApplyAgentStatusChanged) or reconcile-detected (ApplySeenFlip's silent
