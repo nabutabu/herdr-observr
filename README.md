@@ -62,6 +62,31 @@ The binary on its own doesn't register the plugin with Herdr — use
 `herdr plugin install` (above) for that. Every merge to `main` cuts a new
 release with cross-compiled binaries.
 
+## Example dashboard
+
+A demo observability stack lives in `deploy/` — an OpenTelemetry Collector,
+Prometheus, Loki, Tempo, and Grafana, with the example `herdr-observr`
+dashboard pre-provisioned. Running it requires Docker:
+
+```sh
+docker compose -f deploy/compose.yaml up -d
+```
+
+Point the daemon at the collector (default `http://localhost:4317`, which the
+stack listens on) and then open the dashboard:
+
+```sh
+HERDR_SOCKET_PATH=/path/to/your/herdr.sock ./bin/herdr-observr
+# → http://localhost:3000/d/herdr-observr/  (Grafana login: admin / admin)
+```
+
+The dashboard shows agent state counts, state-transition rate, state-duration
+and attention-latency percentiles, per-workspace concurrency, total token usage
+and cost, and recent state-change events and traces. Datapoints group by
+`herdr.machine.id`; set `HERDR_PLUGIN_STATE_DIR` (see Run) to a persistent
+directory so your machine shows up. Tear it down with
+`docker compose -f deploy/compose.yaml down`.
+
 ## Run
 
 The binary runs the telemetry daemon; with no arguments it starts the event
