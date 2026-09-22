@@ -120,6 +120,58 @@ const (
 	WorkspaceConcurrentMetricName = "herdr.workspace.agent.concurrent"
 )
 
+// (U4.1) herdr.session.* — counters fed from UsageCollector.Deltas(): one
+// counter per accrued usage delta, tagged with the session id and its
+// last-known pane/workspace ("last known location" per the U-finding that
+// agent_session is frontmost-right-now) plus agent type. Cost is USD (unit
+// "USD"); each token counter is an integer count.
+//
+// U4.2 (gauge-vs-counter) resolved to counters: the collector re-seeds its
+// in-memory cursor on first poll after a restart (the seed emits nothing), so
+// each counter accrues only usage observed during this process's lifetime; on
+// restart the counter resets and grows again — the standard monotonic-counter
+// behavior rate()/increase() already handle.
+//
+// Privacy: the session id carried here is the durable usage identity (the
+// opencode session row id for Kind "id"), never pane/terminal content. For
+// Kind "path" sessions there is no usage export path today (the opencode
+// adapter only resolves "id"), and path-kind Values stay internal.
+const (
+	// CostMetricName is the U4.1 cost counter metric name.
+	CostMetricName = "herdr.session.cost.usd"
+
+	// TokensInputMetricName is the U4.1 input-token counter metric name.
+	TokensInputMetricName = "herdr.session.tokens.input"
+
+	// TokensOutputMetricName is the U4.1 output-token counter metric name.
+	TokensOutputMetricName = "herdr.session.tokens.output"
+
+	// TokensReasoningMetricName is the U4.1 reasoning-token counter metric name.
+	TokensReasoningMetricName = "herdr.session.tokens.reasoning"
+
+	// TokensCacheReadMetricName is the U4.1 cache-read-token counter metric name.
+	TokensCacheReadMetricName = "herdr.session.tokens.cache_read"
+
+	// TokensCacheWriteMetricName is the U4.1 cache-write-token counter metric name.
+	TokensCacheWriteMetricName = "herdr.session.tokens.cache_write"
+
+	// TokensTotalMetricName is the U4.1 total-token counter metric name. Total
+	// is derived as input + output (no double-counting: reasoning is a subset
+	// of output, cache reads accrue within input).
+	TokensTotalMetricName = "herdr.session.tokens.total"
+
+	// SessionIDKey is the herdr.session.id attribute key — the durable session
+	// identity (adapter-reported; the same id UsageDelta.SessionID carries).
+	SessionIDKey = "herdr.session.id"
+
+	// PaneIDKey is the herdr.pane.id attribute key — the pane where the
+	// session was last observed, resolved via Tracker.Sessions(). Distinct
+	// from AgentIDKey (herdr.agent.id), which is the state-change metrics'
+	// pane scoping id; usage attribution is a session's last-known location,
+	// not a pane↔session binding.
+	PaneIDKey = "herdr.pane.id"
+)
+
 // NewMeterProvider initializes the OTel metrics SDK with the OTLP/gRPC
 // exporter and associates it with res.
 //
@@ -270,4 +322,91 @@ func NewWorkspaceConcurrentGauge(meter apimetric.Meter) (apimetric.Int64Observab
 		apimetric.WithUnit("1"),
 		apimetric.WithDescription("Number of agents concurrently working per workspace (working + blocked)"),
 	)
+}
+
+// UsageMetrics bundles the U4.1 usage counters: one cost counter plus the six
+// token counters (input/output/reasoning/cache_read/cache_write/total).
+// Synchronous counters — created bare, written per-delta from the app's event
+// loop via recordUsageDelta, no callback or registration-time source needed.
+type UsageMetrics struct {
+	Cost             apimetric.Float64Counter
+	TokensInput      apimetric.Int64Counter
+	TokensOutput     apimetric.Int64Counter
+	TokensReasoning  apimetric.Int64Counter
+	TokensCacheRead  apimetric.Int64Counter
+	TokensCacheWrite apimetric.Int64Counter
+	TokensTotal      apimetric.Int64Counter
+}
+
+// NewUsageMetrics registers the U4.1 usage counters on meter and returns the
+// bundle, or an error if any registration failed. The returned counters are
+// no-ops when the meter itself is a no-op (telemetry disabled). Cost is a
+// float counter in USD units; token counters are integer counts with unit "1",
+// accrual per diffed delta (never cumulative).
+func NewUsageMetrics(meter apimetric.Meter) (UsageMetrics, error) {
+	cost, err := meter.Float64Counter(
+		CostMetricName,
+		apimetric.WithUnit("USD"),
+		apimetric.WithDescription("Accrued session cost in USD, tagged by session id and last-known pane/workspace"),
+	)
+	if err != nil {
+		return UsageMetrics{}, err
+	}
+	input, err := meter.Int64Counter(
+		TokensInputMetricName,
+		apimetric.WithUnit("1"),
+		apimetric.WithDescription("Accrued input tokens per session, tagged by session id and last-known pane/workspace"),
+	)
+	if err != nil {
+		return UsageMetrics{}, err
+	}
+	output, err := meter.Int64Counter(
+		TokensOutputMetricName,
+		apimetric.WithUnit("1"),
+		apimetric.WithDescription("Accrued output tokens per session, tagged by session id and last-known pane/workspace"),
+	)
+	if err != nil {
+		return UsageMetrics{}, err
+	}
+	reasoning, err := meter.Int64Counter(
+		TokensReasoningMetricName,
+		apimetric.WithUnit("1"),
+		apimetric.WithDescription("Accrued reasoning tokens per session, tagged by session id and last-known pane/workspace"),
+	)
+	if err != nil {
+		return UsageMetrics{}, err
+	}
+	cacheRead, err := meter.Int64Counter(
+		TokensCacheReadMetricName,
+		apimetric.WithUnit("1"),
+		apimetric.WithDescription("Accrued cache-read tokens per session, tagged by session id and last-known pane/workspace"),
+	)
+	if err != nil {
+		return UsageMetrics{}, err
+	}
+	cacheWrite, err := meter.Int64Counter(
+		TokensCacheWriteMetricName,
+		apimetric.WithUnit("1"),
+		apimetric.WithDescription("Accrued cache-write tokens per session, tagged by session id and last-known pane/workspace"),
+	)
+	if err != nil {
+		return UsageMetrics{}, err
+	}
+	total, err := meter.Int64Counter(
+		TokensTotalMetricName,
+		apimetric.WithUnit("1"),
+		apimetric.WithDescription("Accrued total tokens per session (input + output), tagged by session id and last-known pane/workspace"),
+	)
+	if err != nil {
+		return UsageMetrics{}, err
+	}
+	return UsageMetrics{
+		Cost:             cost,
+		TokensInput:      input,
+		TokensOutput:     output,
+		TokensReasoning:  reasoning,
+		TokensCacheRead:  cacheRead,
+		TokensCacheWrite: cacheWrite,
+		TokensTotal:      total,
+	}, nil
 }

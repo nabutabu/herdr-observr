@@ -10,6 +10,7 @@ import (
 	"github.com/nabutabu/herdr-observr/internal/otel"
 	"github.com/nabutabu/herdr-observr/internal/snapshot"
 	"github.com/nabutabu/herdr-observr/internal/tracker"
+	"github.com/nabutabu/herdr-observr/internal/usage"
 	"go.opentelemetry.io/otel/attribute"
 	sdklog "go.opentelemetry.io/otel/sdk/log"
 	"go.opentelemetry.io/otel/sdk/metric"
@@ -149,6 +150,16 @@ func drainAttentionLatency(t *testing.T, a *App) {
 	}
 }
 
+// recordUsageDeltaResolved replicates Run's select-case body for the U4.1
+// Deltas branch: resolve the delta's last-known attribution from the tracker
+// (U3.2) and forward both to the counters exactly as production does. For
+// tests that can't drive the collector (a real poll) this is the atomic unit
+// under test.
+func recordUsageDeltaResolved(t *testing.T, a *App, d usage.UsageDelta) {
+	t.Helper()
+	a.telemetry.recordUsageDelta(d, a.tr.Sessions()[d.SessionID])
+}
+
 // captureLogExporter is a minimal sdklog.Exporter that snapshots emitted
 // event records for assertion, wired synchronously through a SimpleProcessor so
 // records are captured at Emit time.
@@ -254,6 +265,24 @@ func findInt64SumPoints(t *testing.T, rm metricdata.ResourceMetrics, name string
 			sum, ok := m.Data.(metricdata.Sum[int64])
 			if !ok {
 				t.Fatalf("metric %s data type = %T, want Sum[int64]", name, m.Data)
+			}
+			out = append(out, sum.DataPoints...)
+		}
+	}
+	return out
+}
+
+func findFloat64SumPoints(t *testing.T, rm metricdata.ResourceMetrics, name string) []metricdata.DataPoint[float64] {
+	t.Helper()
+	var out []metricdata.DataPoint[float64]
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			if m.Name != name {
+				continue
+			}
+			sum, ok := m.Data.(metricdata.Sum[float64])
+			if !ok {
+				t.Fatalf("metric %s data type = %T, want Sum[float64]", name, m.Data)
 			}
 			out = append(out, sum.DataPoints...)
 		}
@@ -875,6 +904,129 @@ func TestCountGaugesNoopWithoutTelemetry(t *testing.T) {
 	a := &App{tr: tracker.NewTracker()}
 	a.telemetry.registerCountGauges(a.tr.Counts)
 	a.tr.ApplyAgentStatusChanged(events.NormalizedEvent{Kind: events.KindAgentStatusChanged, PaneID: "w1:p1", WorkspaceID: "w1", Agent: "codex", NewState: snapshot.AgentStatusWorking})
+}
+
+func TestRecordUsageCountersEventDriven(t *testing.T) {
+	// (U4.1) One accrued usage delta increments the cost counter and all six
+	// token counters, tagged with the session id and the session's last-known
+	// pane/workspace/agent location (U3.2 resolution, exactly as production's
+	// Run with the Deltas case).
+	reader := metric.NewManualReader()
+	mp := otel.NewMeterProviderWithReader(reader, resource.NewSchemaless(attribute.String("service.name", "test")))
+	defer func() { _ = mp.Shutdown(context.Background()) }()
+
+	a := &App{
+		telemetry: &Telemetry{meter: mp.Meter(otel.MeterName)},
+		tr:        tracker.NewTracker(),
+	}
+	a.telemetry.registerUsage()
+	if a.telemetry.usage == nil {
+		t.Fatal("registerUsage did not create the usage counters")
+	}
+
+	// Seed the tracker's session→attribution index (U3.2) so the delta
+	// resolves to pane/workspace/agent tags.
+	sess := snapshot.AgentSessionInfo{Source: "herdr:opencode", Agent: "opencode", Kind: snapshot.AgentSessionRefKindID, Value: "ses_1"}
+	agent := "opencode"
+	resp := snapshot.Snapshot{
+		Panes: []snapshot.Pane{
+			{PaneID: "w1:p1", WorkspaceID: "w1", TabID: "w1:t1", Agent: &agent, AgentSession: &sess, AgentStatus: snapshot.AgentStatusWorking},
+		},
+	}
+	a.tr.ApplySnapshot(resp)
+
+	d := usage.UsageDelta{SessionID: "ses_1", CostUSD: 0.10, InputTokens: 40, OutputTokens: 20, ReasoningTokens: 2, CacheReadTokens: 3, CacheWriteTokens: 1}
+	recordUsageDeltaResolved(t, a, d)
+
+	var rm metricdata.ResourceMetrics
+	if err := reader.Collect(context.Background(), &rm); err != nil {
+		t.Fatalf("collect: %v", err)
+	}
+
+	wantTokens := map[string]int64{
+		otel.TokensInputMetricName:      40,
+		otel.TokensOutputMetricName:     20,
+		otel.TokensReasoningMetricName:  2,
+		otel.TokensCacheReadMetricName:  3,
+		otel.TokensCacheWriteMetricName: 1,
+		otel.TokensTotalMetricName:      60, // derived input + output
+	}
+	for name, want := range wantTokens {
+		points := findInt64SumPoints(t, rm, name)
+		if len(points) != 1 {
+			t.Fatalf("%s datapoints = %d, want 1", name, len(points))
+		}
+		if points[0].Value != want {
+			t.Errorf("%s = %d, want %d", name, points[0].Value, want)
+		}
+		if got := attrString(t, points[0].Attributes, otel.SessionIDKey); got != "ses_1" {
+			t.Errorf("%s session.id = %q, want ses_1", name, got)
+		}
+		if got := attrString(t, points[0].Attributes, otel.PaneIDKey); got != "w1:p1" {
+			t.Errorf("%s pane.id = %q, want w1:p1", name, got)
+		}
+		if got := attrString(t, points[0].Attributes, otel.WorkspaceIDKey); got != "w1" {
+			t.Errorf("%s workspace.id = %q, want w1", name, got)
+		}
+		if got := attrString(t, points[0].Attributes, otel.AgentTypeKey); got != "opencode" {
+			t.Errorf("%s agent.type = %q, want opencode", name, got)
+		}
+	}
+
+	cost := findFloat64SumPoints(t, rm, otel.CostMetricName)
+	if len(cost) != 1 {
+		t.Fatalf("cost datapoints = %d, want 1", len(cost))
+	}
+	if cost[0].Value != 0.10 {
+		t.Errorf("cost = %v, want 0.10", cost[0].Value)
+	}
+	if got := attrString(t, cost[0].Attributes, otel.SessionIDKey); got != "ses_1" {
+		t.Errorf("cost session.id = %q, want ses_1", got)
+	}
+}
+
+func TestRecordUsageCountersMissAttributionUntagged(t *testing.T) {
+	// The session's id is never in the tracker's index (miss → U3.2's
+	// "emit untagged"): the counters still increment with the session id,
+	// but carry no pane/workspace/agent location attributes.
+	reader := metric.NewManualReader()
+	mp := otel.NewMeterProviderWithReader(reader, resource.NewSchemaless(attribute.String("service.name", "test")))
+	defer func() { _ = mp.Shutdown(context.Background()) }()
+
+	a := &App{
+		telemetry: &Telemetry{meter: mp.Meter(otel.MeterName)},
+		tr:        tracker.NewTracker(),
+	}
+	a.telemetry.registerUsage()
+
+	d := usage.UsageDelta{SessionID: "ses_unknown", CostUSD: 0.05, InputTokens: 10, OutputTokens: 5}
+	recordUsageDeltaResolved(t, a, d)
+
+	var rm metricdata.ResourceMetrics
+	if err := reader.Collect(context.Background(), &rm); err != nil {
+		t.Fatalf("collect: %v", err)
+	}
+
+	points := findInt64SumPoints(t, rm, otel.TokensInputMetricName)
+	if len(points) != 1 || points[0].Value != 10 {
+		t.Fatalf("input datapoints = %+v, want a single value 10", points)
+	}
+	if got := attrString(t, points[0].Attributes, otel.SessionIDKey); got != "ses_unknown" {
+		t.Errorf("session.id = %q, want ses_unknown", got)
+	}
+	for _, key := range []string{otel.PaneIDKey, otel.WorkspaceIDKey, otel.AgentTypeKey} {
+		if _, ok := points[0].Attributes.Value(attribute.Key(key)); ok {
+			t.Errorf("attribute %q present on untagged delta; want omitted", key)
+		}
+	}
+}
+
+func TestRecordUsageNoopWithoutTelemetry(t *testing.T) {
+	// Telemetry disabled (nil usage bundle): consuming deltas must be a no-op,
+	// never a panic or block.
+	a := &App{tr: tracker.NewTracker()}
+	d := usage.UsageDelta{SessionID: "ses_1", InputTokens: 1}
+	a.telemetry.recordUsageDelta(d, a.tr.Sessions()[d.SessionID])
 }
 
 func TestHandleEventRoutesTabKinds(t *testing.T) {

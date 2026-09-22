@@ -157,8 +157,6 @@ Top open items (as of current `main`):
 - **1.2** — self-supervising external-process wrapper with crash/respawn backoff
   for the `[[startup]]` hook (it would finally cover the finite initial-connection
   budget in fact #1).
-- **U4.1** — export usage deltas as OTel telemetry; the U1.2 collector runs and
-  `Deltas()` arrives in `App.Run` but is only debug-logged.
 - **Phase 5 (reliability hardening)** — stress tests: crash-loop ceiling (moot
   until 1.2), the socket-unavailable-at-startup race, and a protocol-version
   check on connect. OTLP-endpoint-unreachable is covered structurally by the

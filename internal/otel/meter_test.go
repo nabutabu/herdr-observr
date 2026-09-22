@@ -412,6 +412,122 @@ func TestMeterProviderAssociatesResource(t *testing.T) {
 	}
 }
 
+func TestUsageMetricsRegistersAndIncrements(t *testing.T) {
+	// (U4.1) Pin the seven usage metric names, their units, and the attribute
+	// shape: cost recorded in USD (float), token counts integer with unit "1",
+	// every datapoint carrying the session id plus the last-known location
+	// attrs. The app-layer test drives real client-side deltas through them.
+	setCleanEnv(t)
+
+	res, err := BuildResource(context.Background())
+	if err != nil {
+		t.Fatalf("BuildResource: %v", err)
+	}
+
+	reader := metric.NewManualReader()
+	mp := newMeterProviderWithReader(reader, res)
+	defer func() { _ = mp.Shutdown(context.Background()) }()
+
+	um, err := NewUsageMetrics(mp.Meter(MeterName))
+	if err != nil {
+		t.Fatalf("NewUsageMetrics: %v", err)
+	}
+
+	attrs := []attribute.KeyValue{
+		attribute.String(SessionIDKey, "ses_1"),
+		attribute.String(PaneIDKey, "w1:p1"),
+		attribute.String(WorkspaceIDKey, "w1"),
+		attribute.String(AgentTypeKey, "opencode"),
+	}
+	um.Cost.Add(context.Background(), 0.10, otmetric.WithAttributes(attrs...))
+	um.TokensInput.Add(context.Background(), 40, otmetric.WithAttributes(attrs...))
+	um.TokensOutput.Add(context.Background(), 20, otmetric.WithAttributes(attrs...))
+	um.TokensReasoning.Add(context.Background(), 2, otmetric.WithAttributes(attrs...))
+	um.TokensCacheRead.Add(context.Background(), 3, otmetric.WithAttributes(attrs...))
+	um.TokensCacheWrite.Add(context.Background(), 1, otmetric.WithAttributes(attrs...))
+	um.TokensTotal.Add(context.Background(), 60, otmetric.WithAttributes(attrs...))
+
+	var rm metricdata.ResourceMetrics
+	if err := reader.Collect(context.Background(), &rm); err != nil {
+		t.Fatalf("collect: %v", err)
+	}
+
+	intWants := map[string]int64{
+		TokensInputMetricName:      40,
+		TokensOutputMetricName:     20,
+		TokensReasoningMetricName:  2,
+		TokensCacheReadMetricName:  3,
+		TokensCacheWriteMetricName: 1,
+		TokensTotalMetricName:      60,
+	}
+	for name, v := range intWants {
+		seen := false
+		for _, sm := range rm.ScopeMetrics {
+			for _, m := range sm.Metrics {
+				if m.Name != name {
+					continue
+				}
+				seen = true
+				if m.Unit != "1" {
+					t.Errorf("unit = %q, want %q", m.Unit, "1")
+				}
+				sum, ok := m.Data.(metricdata.Sum[int64])
+				if !ok {
+					t.Fatalf("data type = %T, want Sum[int64]", m.Data)
+				}
+				if len(sum.DataPoints) != 1 || sum.DataPoints[0].Value != v {
+					t.Errorf("datapoints = %+v, want a single value %d", sum.DataPoints, v)
+				}
+				checkUsageAttrs(t, sum.DataPoints[0].Attributes)
+			}
+		}
+		if !seen {
+			t.Errorf("metric %q not found in collected data", name)
+		}
+	}
+
+	// Cost is a float sum in USD units with the same attribute shape.
+	seen := false
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			if m.Name != CostMetricName {
+				continue
+			}
+			seen = true
+			if m.Unit != "USD" {
+				t.Errorf("unit = %q, want %q", m.Unit, "USD")
+			}
+			sum, ok := m.Data.(metricdata.Sum[float64])
+			if !ok {
+				t.Fatalf("data type = %T, want Sum[float64]", m.Data)
+			}
+			if len(sum.DataPoints) != 1 || sum.DataPoints[0].Value != 0.10 {
+				t.Errorf("datapoints = %+v, want a single value 0.10", sum.DataPoints)
+			}
+			checkUsageAttrs(t, sum.DataPoints[0].Attributes)
+		}
+	}
+	if !seen {
+		t.Fatalf("metric %q not found in collected data", CostMetricName)
+	}
+}
+
+// checkUsageAttrs verifies a U4.1 datapoint's set carries the session id and
+// the last-known location attributes.
+func checkUsageAttrs(t *testing.T, set attribute.Set) {
+	t.Helper()
+	for key, want := range map[attribute.Key]string{
+		attribute.Key(SessionIDKey):   "ses_1",
+		attribute.Key(PaneIDKey):      "w1:p1",
+		attribute.Key(WorkspaceIDKey): "w1",
+		attribute.Key(AgentTypeKey):   "opencode",
+	} {
+		if v, ok := set.Value(key); !ok || v.AsString() != want {
+			t.Errorf("attribute %q = %v (ok=%v), want %q", string(key), v, ok, want)
+		}
+	}
+}
+
 func TestMachineAttrsRideOnCollectedResource(t *testing.T) {
 	// The machine attributes must reach the exported OTLP resource, not just
 	// the in-memory one — prove it structurally with a manual reader (the same

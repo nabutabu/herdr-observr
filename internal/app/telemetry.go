@@ -16,6 +16,7 @@ import (
 	"github.com/nabutabu/herdr-observr/internal/otel"
 	"github.com/nabutabu/herdr-observr/internal/snapshot"
 	"github.com/nabutabu/herdr-observr/internal/tracker"
+	"github.com/nabutabu/herdr-observr/internal/usage"
 )
 
 // Telemetry owns the process's OTel instruments (Phase 3): the meter, the
@@ -46,6 +47,10 @@ type Telemetry struct {
 	// (3.5), defined only when telemetry initialized. Nil means
 	// recordAttentionLatency no-ops.
 	attentionLatencyHistogram metric.Float64Histogram
+
+	// usage is the U4.1 session usage counters (herdr.session.*), defined only
+	// when telemetry initialized. Nil means recordUsageDelta no-ops.
+	usage *otel.UsageMetrics
 
 	// logger emits the 3.8 structured state-change events (over the OTLP Logs
 	// signal), defined only when the logs SDK initialized. Nil means
@@ -99,6 +104,7 @@ func NewTelemetry(ctx context.Context) *Telemetry {
 	t.registerTransitions()
 	t.registerStateDurations()
 	t.registerAttentionLatency()
+	t.registerUsage()
 	return t
 }
 
@@ -323,6 +329,65 @@ func (t *Telemetry) recordAttentionLatency(al tracker.AttentionLatency) {
 			attribute.String(otel.AgentTypeKey, al.Agent),
 		),
 	)
+}
+
+// registerUsage registers the U4.1 herdr.session.* usage counters. Registration
+// failure (e.g. a stale meter) disables usage telemetry, never the
+// subscription or the collector.
+func (t *Telemetry) registerUsage() {
+	if t.meter == nil {
+		return
+	}
+	um, err := otel.NewUsageMetrics(t.meter)
+	if err != nil {
+		slog.Warn("registering usage counters failed", "error", err)
+		return
+	}
+	t.usage = &um
+}
+
+// recordUsageDelta records one accrued usage delta (U4.1) across the
+// herdr.session.* counters: cost, the five token breakdowns, and the derived
+// total (input + output). att is the session's last-known attribution from
+// Tracker.Sessions() — pane/workspace/agent tags are attached only when
+// non-empty, so a session whose location went stale or was never observed
+// exports untagged (accept per the U-finding: the session, not its pane, is
+// the durable identity). The session id is always attached: it is the
+// durable usage identity (the opencode session row id), never pane/terminal
+// content. A nil Telemetry or usage bundle (telemetry disabled or
+// registration failed) is a no-op.
+//
+// U4.2 (gauge-vs-counter) resolved to counters: deltas are accrual-only (the
+// collector re-seeds its cursor on restart and on source reset, so no
+// fabricated spike), and the SDK stamps each Add at record time — the
+// "observed timestamp at export time" the plan calls for, since consumption
+// is event-driven and within one collection interval of observation.
+func (t *Telemetry) recordUsageDelta(d usage.UsageDelta, att tracker.SessionAttribution) {
+	if t == nil || t.usage == nil {
+		return
+	}
+	attrs := []attribute.KeyValue{
+		attribute.String(otel.SessionIDKey, d.SessionID),
+	}
+	// Last-known location: attach only what's populated, so a stale/missing
+	// attribution degrades to untagged rather than empty-value attributes.
+	if att.PaneID != "" {
+		attrs = append(attrs, attribute.String(otel.PaneIDKey, att.PaneID))
+	}
+	if att.WorkspaceID != "" {
+		attrs = append(attrs, attribute.String(otel.WorkspaceIDKey, att.WorkspaceID))
+	}
+	if att.AgentType != "" {
+		attrs = append(attrs, attribute.String(otel.AgentTypeKey, att.AgentType))
+	}
+
+	t.usage.Cost.Add(context.Background(), d.CostUSD, metric.WithAttributes(attrs...))
+	t.usage.TokensInput.Add(context.Background(), d.InputTokens, metric.WithAttributes(attrs...))
+	t.usage.TokensOutput.Add(context.Background(), d.OutputTokens, metric.WithAttributes(attrs...))
+	t.usage.TokensReasoning.Add(context.Background(), d.ReasoningTokens, metric.WithAttributes(attrs...))
+	t.usage.TokensCacheRead.Add(context.Background(), d.CacheReadTokens, metric.WithAttributes(attrs...))
+	t.usage.TokensCacheWrite.Add(context.Background(), d.CacheWriteTokens, metric.WithAttributes(attrs...))
+	t.usage.TokensTotal.Add(context.Background(), d.InputTokens+d.OutputTokens, metric.WithAttributes(attrs...))
 }
 
 // registerCountGauges registers the 3.6 herdr.agent.{active,blocked,idle,done,

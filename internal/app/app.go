@@ -172,9 +172,13 @@ func (a *App) Run(ctx context.Context) error {
 			slog.Debug("agent state change", "pane_id", tr.PaneID, "agent", tr.Agent, "previous", tr.Previous, "new", tr.New)
 
 		case d := <-a.uc.Deltas():
-			// U1.2/U4.1: export usage deltas as OTel telemetry. Placeholder
-			// until the exporter step lands; logged for now so the
-			// event-driven path is observable end to end.
+			// U4.1: export each accrued usage delta across the
+			// herdr.session.* counters, tagged with the session id and its
+			// last-known pane/workspace/agent location from the tracker's
+			// session→attribution index (U3.2; miss → untagged). Read on the
+			// event-loop goroutine; Sessions() takes an RLock shallow copy, so
+			// tracker single-writer discipline is intact.
+			a.telemetry.recordUsageDelta(d, a.tr.Sessions()[d.SessionID])
 			slog.Debug("usage delta", "session_id", d.SessionID, "cost_usd", d.CostUSD,
 				"input_tokens", d.InputTokens, "output_tokens", d.OutputTokens)
 
