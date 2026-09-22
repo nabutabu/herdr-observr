@@ -16,17 +16,6 @@
         "query": "prometheus",
         "label": "Data source",
         "hide": 0
-      },
-      {
-        "name": "traceId",
-        "type": "custom",
-        "label": "Trace ID",
-        "hide": 0,
-        "multi": true,
-        "includeAll": false,
-        "query": "",
-        "options": [],
-        "current": {}
       }
     ]
   },
@@ -177,7 +166,7 @@
       "id": 10,
       "type": "table",
       "title": "Recent agent state-change traces",
-      "description": "TraceQL search results render as a table; Grafana's Traces panel renders a single trace. Click a Trace ID to load its waterfall below.",
+      "description": "TraceQL search results render as a table; Grafana's Traces panel renders a single trace.",
       "datasource": { "type": "tempo", "uid": "tempo" },
       "gridPos": { "h": 10, "w": 12, "x": 12, "y": 24 },
       "fieldConfig": {
@@ -185,20 +174,6 @@
           "custom": { "align": "auto", "cellOptions": { "type": "auto" }, "inspect": false, "filterable": true }
         },
         "overrides": [
-          {
-            "matcher": { "id": "byName", "options": "traceID" },
-            "properties": [
-              {
-                "id": "links",
-                "value": [
-                  {
-                    "title": "View waterfall on this dashboard",
-                    "url": "/d/${__dashboard.uid}/?var-traceId=${__value.raw}&${__url_time_range}"
-                  }
-                ]
-              }
-            ]
-          },
           {
             "matcher": { "id": "byName", "options": "nested" },
             "properties": [ { "id": "custom.hidden", "value": true } ]
@@ -223,23 +198,23 @@
     },
     {
       "id": 11,
-      "type": "traces",
-      "title": "Trace waterfall: $traceId",
-      "description": "Click a Trace ID in the table above to populate the traceId variable and render its waterfall.",
-      "datasource": { "type": "tempo", "uid": "tempo" },
-      "gridPos": { "h": 10, "w": 12, "x": 12, "y": 34 },
-      "repeat": "traceId",
-      "repeatDirection": "h",
-      "maxPerRow": 1,
-      "options": {},
-      "targets": [
-        {
-          "refId": "A",
-          "datasource": { "type": "tempo", "uid": "tempo" },
-          "queryType": "traceId",
-          "query": "${traceId}"
-        }
-      ]
+      "type": "stat",
+      "title": "Total tokens",
+      "description": "Total token usage (input + output, cache and reasoning excluded) accrued across all sessions over the selected range.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 6, "x": 12, "y": 34 },
+      "fieldConfig": { "defaults": { "unit": "short" } },
+      "targets": [ { "refId": "A", "expr": "sum(increase(herdr_session_tokens_total[$__range]))" } ]
+    },
+    {
+      "id": 12,
+      "type": "stat",
+      "title": "Total cost",
+      "description": "Session usage cost accrued across all sessions over the selected range.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 6, "x": 18, "y": 34 },
+      "fieldConfig": { "defaults": { "unit": "currencyUSD" } },
+      "targets": [ { "refId": "A", "expr": "sum(increase(herdr_session_cost_usd_USD_total[$__range]))" } ]
     }
   ]
 }
