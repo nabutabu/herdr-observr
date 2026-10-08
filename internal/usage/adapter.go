@@ -68,9 +68,12 @@ type UsageTotals struct {
 // Fields are deltas by construction — never negative by design (a decrease is
 // treated as a source reset and re-seeds the cursor instead of emitting).
 // Attribution (which pane/workspace last pointed at the session) is a U3/U4
-// concern and deliberately absent here.
+// concern and deliberately absent here. ParentID is carried through from the
+// source totals ("" for a root) so U4 can tag child series and fall back to
+// the parent's attribution; it is lifecycle metadata (an id), not pane content.
 type UsageDelta struct {
 	SessionID        string
+	ParentID         string
 	CostUSD          float64
 	InputTokens      int64
 	OutputTokens     int64
