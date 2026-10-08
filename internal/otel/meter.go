@@ -164,6 +164,12 @@ const (
 	// identity (adapter-reported; the same id UsageDelta.SessionID carries).
 	SessionIDKey = "herdr.session.id"
 
+	// ParentIDKey is the herdr.session.parent.id attribute key — the parent
+	// session id for a sub-session (UsageDelta.ParentID). Attached only when
+	// the session has a parent, so root series carry no parent attribute. It
+	// is lifecycle metadata (an id), never pane/terminal content.
+	ParentIDKey = "herdr.session.parent.id"
+
 	// PaneIDKey is the herdr.pane.id attribute key — the pane where the
 	// session was last observed, resolved via Tracker.Sessions(). Distinct
 	// from AgentIDKey (herdr.agent.id), which is the state-change metrics'

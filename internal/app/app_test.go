@@ -152,12 +152,12 @@ func drainAttentionLatency(t *testing.T, a *App) {
 
 // recordUsageDeltaResolved replicates Run's select-case body for the U4.1
 // Deltas branch: resolve the delta's last-known attribution from the tracker
-// (U3.2) and forward both to the counters exactly as production does. For
-// tests that can't drive the collector (a real poll) this is the atomic unit
-// under test.
+// (U3.2, with the parent fallback for sub-sessions) and forward both to the
+// counters exactly as production does. For tests that can't drive the collector
+// (a real poll) this is the atomic unit under test.
 func recordUsageDeltaResolved(t *testing.T, a *App, d usage.UsageDelta) {
 	t.Helper()
-	a.telemetry.recordUsageDelta(d, a.tr.Sessions()[d.SessionID])
+	a.telemetry.recordUsageDelta(d, a.resolveSessionAttribution(d))
 }
 
 // captureLogExporter is a minimal sdklog.Exporter that snapshots emitted
@@ -971,6 +971,9 @@ func TestRecordUsageCountersEventDriven(t *testing.T) {
 		if got := attrString(t, points[0].Attributes, otel.AgentTypeKey); got != "opencode" {
 			t.Errorf("%s agent.type = %q, want opencode", name, got)
 		}
+		if _, ok := points[0].Attributes.Value(attribute.Key(otel.ParentIDKey)); ok {
+			t.Errorf("%s parent.id present on a root delta; want omitted", name)
+		}
 	}
 
 	cost := findFloat64SumPoints(t, rm, otel.CostMetricName)
@@ -1017,6 +1020,93 @@ func TestRecordUsageCountersMissAttributionUntagged(t *testing.T) {
 	for _, key := range []string{otel.PaneIDKey, otel.WorkspaceIDKey, otel.AgentTypeKey} {
 		if _, ok := points[0].Attributes.Value(attribute.Key(key)); ok {
 			t.Errorf("attribute %q present on untagged delta; want omitted", key)
+		}
+	}
+}
+
+func TestRecordUsageChildInheritsParentAttribution(t *testing.T) {
+	// A sub-session never appears in the tracker's index (children are
+	// wire-invisible). Its delta still carries the session id and parent id,
+	// and inherits pane/workspace/agent from the parent's attribution.
+	reader := metric.NewManualReader()
+	mp := otel.NewMeterProviderWithReader(reader, resource.NewSchemaless(attribute.String("service.name", "test")))
+	defer func() { _ = mp.Shutdown(context.Background()) }()
+
+	a := &App{
+		telemetry: &Telemetry{meter: mp.Meter(otel.MeterName)},
+		tr:        tracker.NewTracker(),
+	}
+	a.telemetry.registerUsage()
+
+	sess := snapshot.AgentSessionInfo{Source: "herdr:opencode", Agent: "opencode", Kind: snapshot.AgentSessionRefKindID, Value: "ses_root"}
+	agent := "opencode"
+	a.tr.ApplySnapshot(snapshot.Snapshot{
+		Panes: []snapshot.Pane{
+			{PaneID: "w1:p1", WorkspaceID: "w1", TabID: "w1:t1", Agent: &agent, AgentSession: &sess, AgentStatus: snapshot.AgentStatusWorking},
+		},
+	})
+
+	d := usage.UsageDelta{SessionID: "ses_child", ParentID: "ses_root", CostUSD: 0.05, InputTokens: 10}
+	recordUsageDeltaResolved(t, a, d)
+
+	var rm metricdata.ResourceMetrics
+	if err := reader.Collect(context.Background(), &rm); err != nil {
+		t.Fatalf("collect: %v", err)
+	}
+	points := findInt64SumPoints(t, rm, otel.TokensInputMetricName)
+	if len(points) != 1 {
+		t.Fatalf("input datapoints = %d, want 1", len(points))
+	}
+	if got := attrString(t, points[0].Attributes, otel.SessionIDKey); got != "ses_child" {
+		t.Errorf("session.id = %q, want ses_child", got)
+	}
+	if got := attrString(t, points[0].Attributes, otel.ParentIDKey); got != "ses_root" {
+		t.Errorf("session.parent.id = %q, want ses_root", got)
+	}
+	if got := attrString(t, points[0].Attributes, otel.PaneIDKey); got != "w1:p1" {
+		t.Errorf("pane.id = %q, want w1:p1 (inherited from parent)", got)
+	}
+	if got := attrString(t, points[0].Attributes, otel.WorkspaceIDKey); got != "w1" {
+		t.Errorf("workspace.id = %q, want w1 (inherited from parent)", got)
+	}
+	if got := attrString(t, points[0].Attributes, otel.AgentTypeKey); got != "opencode" {
+		t.Errorf("agent.type = %q, want opencode (inherited from parent)", got)
+	}
+}
+
+func TestRecordUsageBothAttributionMissesKeepParentID(t *testing.T) {
+	// Neither the session nor its parent is in the tracker index: the counters
+	// still carry the session id and parent id, with no location attributes.
+	reader := metric.NewManualReader()
+	mp := otel.NewMeterProviderWithReader(reader, resource.NewSchemaless(attribute.String("service.name", "test")))
+	defer func() { _ = mp.Shutdown(context.Background()) }()
+
+	a := &App{
+		telemetry: &Telemetry{meter: mp.Meter(otel.MeterName)},
+		tr:        tracker.NewTracker(),
+	}
+	a.telemetry.registerUsage()
+
+	d := usage.UsageDelta{SessionID: "ses_child", ParentID: "ses_root", InputTokens: 7}
+	recordUsageDeltaResolved(t, a, d)
+
+	var rm metricdata.ResourceMetrics
+	if err := reader.Collect(context.Background(), &rm); err != nil {
+		t.Fatalf("collect: %v", err)
+	}
+	points := findInt64SumPoints(t, rm, otel.TokensInputMetricName)
+	if len(points) != 1 || points[0].Value != 7 {
+		t.Fatalf("input datapoints = %+v, want a single value 7", points)
+	}
+	if got := attrString(t, points[0].Attributes, otel.SessionIDKey); got != "ses_child" {
+		t.Errorf("session.id = %q, want ses_child", got)
+	}
+	if got := attrString(t, points[0].Attributes, otel.ParentIDKey); got != "ses_root" {
+		t.Errorf("session.parent.id = %q, want ses_root", got)
+	}
+	for _, key := range []string{otel.PaneIDKey, otel.WorkspaceIDKey, otel.AgentTypeKey} {
+		if _, ok := points[0].Attributes.Value(attribute.Key(key)); ok {
+			t.Errorf("attribute %q present on location-miss delta; want omitted", key)
 		}
 	}
 }

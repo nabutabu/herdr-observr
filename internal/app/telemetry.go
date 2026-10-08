@@ -349,13 +349,15 @@ func (t *Telemetry) registerUsage() {
 // recordUsageDelta records one accrued usage delta (U4.1) across the
 // herdr.session.* counters: cost, the five token breakdowns, and the derived
 // total (input + output). att is the session's last-known attribution from
-// Tracker.Sessions() — pane/workspace/agent tags are attached only when
-// non-empty, so a session whose location went stale or was never observed
-// exports untagged (accept per the U-finding: the session, not its pane, is
-// the durable identity). The session id is always attached: it is the
-// durable usage identity (the opencode session row id), never pane/terminal
-// content. A nil Telemetry or usage bundle (telemetry disabled or
-// registration failed) is a no-op.
+// Tracker.Sessions() (or, for a sub-session, its parent's — resolved by the
+// caller) — pane/workspace/agent tags are attached only when non-empty, so a
+// session whose location went stale or was never observed exports untagged
+// (accept per the U-finding: the session, not its pane, is the durable
+// identity). The session id is always attached: it is the durable usage
+// identity (the opencode session row id), never pane/terminal content. A
+// non-empty ParentID is attached as herdr.session.parent.id so child series
+// stay distinguishable from their root. A nil Telemetry or usage bundle
+// (telemetry disabled or registration failed) is a no-op.
 //
 // U4.2 (gauge-vs-counter) resolved to counters: deltas are accrual-only (the
 // collector re-seeds its cursor on restart and on source reset, so no
@@ -368,6 +370,9 @@ func (t *Telemetry) recordUsageDelta(d usage.UsageDelta, att tracker.SessionAttr
 	}
 	attrs := []attribute.KeyValue{
 		attribute.String(otel.SessionIDKey, d.SessionID),
+	}
+	if d.ParentID != "" {
+		attrs = append(attrs, attribute.String(otel.ParentIDKey, d.ParentID))
 	}
 	// Last-known location: attach only what's populated, so a stale/missing
 	// attribution degrades to untagged rather than empty-value attributes.
