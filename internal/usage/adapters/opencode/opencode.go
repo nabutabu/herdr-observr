@@ -67,17 +67,26 @@ func (a *OpencodeAdapter) AgentType() string { return "opencode" }
 
 var _ usage.UsageAdapter = (*OpencodeAdapter)(nil)
 
-// PollUsage resolves ref (Kind == "id") and returns the session tree's current
-// cumulative totals. The message table is never read; only the session row's
-// cost/token columns participate. NULL usage columns scan as zero (a fresh
-// session can legally hold NULL), and a missing session returns
-// ErrSessionNotFound. The returned SessionID is the authoritative id scanned
-// from the row itself — identical to ref.Value by primary key, but reported
-// from the source rather than echoed from the lookup key.
+// maxParentWalkDepth bounds resolveRoot's upward walk. Real trees are depth 2
+// today (root + direct children, confirmed live and by an offline census that
+// found zero grandchildren), so this is cheap insurance against a corrupt or
+// cyclic parent_id chain, never a real depth limit.
+const maxParentWalkDepth = 64
+
+// PollUsage resolves ref (Kind == "id") to the root of its session tree and
+// returns one UsageTotals per session in that tree — the root plus every
+// parent_id descendant. Resolving up from the referenced session (rather than
+// assuming ref names the root) means children, which are wire-invisible, are
+// captured no matter which session the pane's frontmost agent_session points
+// at.
 //
-// Phase 1 seam note: this currently returns only the referenced row. Phase 2
-// resolves ref to its root and returns the whole parent_id subtree in one
-// recursive query.
+// The message table is never read; only the session row's cost/token columns
+// participate. NULL usage columns scan as zero (a fresh session can legally
+// hold NULL), and a NULL parent_id scans to "" (root). A referenced session
+// with no row is ErrSessionNotFound; a broken ancestor chain stops at the last
+// existing id rather than failing the poll. The returned SessionIDs are the
+// authoritative ids scanned from the rows themselves, never echoed from the
+// lookup key.
 func (a *OpencodeAdapter) PollUsage(ctx context.Context, ref usage.AgentSessionRef) ([]usage.UsageTotals, error) {
 	if ref.Kind != snapshot.AgentSessionRefKindID {
 		return nil, fmt.Errorf("%w: %q", ErrUnsupportedKind, ref.Kind)
@@ -89,34 +98,85 @@ func (a *OpencodeAdapter) PollUsage(ctx context.Context, ref usage.AgentSessionR
 	}
 	defer db.Close()
 
-	var (
-		id                    string
-		cost                  sql.NullFloat64
-		input, output         sql.NullInt64
-		reasoning             sql.NullInt64
-		cacheRead, cacheWrite sql.NullInt64
-	)
-	err = db.QueryRowContext(ctx, `
-		SELECT id, cost, tokens_input, tokens_output, tokens_reasoning,
-		       tokens_cache_read, tokens_cache_write
-		FROM session WHERE id = ?`, ref.Value).
-		Scan(&id, &cost, &input, &output, &reasoning, &cacheRead, &cacheWrite)
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil, fmt.Errorf("%w: %q", ErrSessionNotFound, ref.Value)
-	}
+	root, err := resolveRoot(ctx, db, ref.Value)
 	if err != nil {
-		return nil, fmt.Errorf("querying session %q: %w", ref.Value, err)
+		return nil, err
 	}
 
-	return []usage.UsageTotals{{
-		SessionID:        id,
-		CostUSD:          cost.Float64,
-		InputTokens:      input.Int64,
-		OutputTokens:     output.Int64,
-		ReasoningTokens:  reasoning.Int64,
-		CacheReadTokens:  cacheRead.Int64,
-		CacheWriteTokens: cacheWrite.Int64,
-	}}, nil
+	// One recursive CTE returns the whole subtree: the seed is the root, and
+	// each step adds the children of everything already in `tree`. UNION (not
+	// UNION ALL) dedups, so a cyclic parent_id chain terminates instead of
+	// recursing forever. session_parent_idx makes the parent_id join indexed.
+	rows, err := db.QueryContext(ctx, `
+		WITH RECURSIVE tree(id) AS (
+			VALUES(?)
+			UNION
+			SELECT s.id FROM session s JOIN tree t ON s.parent_id = t.id
+		)
+		SELECT id, parent_id, cost, tokens_input, tokens_output,
+		       tokens_reasoning, tokens_cache_read, tokens_cache_write
+		FROM session WHERE id IN (SELECT id FROM tree)`, root)
+	if err != nil {
+		return nil, fmt.Errorf("querying session tree %q: %w", root, err)
+	}
+	defer rows.Close()
+
+	var out []usage.UsageTotals
+	for rows.Next() {
+		var (
+			id                    string
+			parent                sql.NullString
+			cost                  sql.NullFloat64
+			input, output         sql.NullInt64
+			reasoning             sql.NullInt64
+			cacheRead, cacheWrite sql.NullInt64
+		)
+		if err := rows.Scan(&id, &parent, &cost, &input, &output, &reasoning, &cacheRead, &cacheWrite); err != nil {
+			return nil, fmt.Errorf("scanning session tree row for %q: %w", root, err)
+		}
+		out = append(out, usage.UsageTotals{
+			SessionID:        id,
+			ParentID:         parent.String,
+			CostUSD:          cost.Float64,
+			InputTokens:      input.Int64,
+			OutputTokens:     output.Int64,
+			ReasoningTokens:  reasoning.Int64,
+			CacheReadTokens:  cacheRead.Int64,
+			CacheWriteTokens: cacheWrite.Int64,
+		})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("reading session tree %q: %w", root, err)
+	}
+	return out, nil
+}
+
+// resolveRoot walks parent_id upward from id to the top of its session tree.
+// Depth is tiny (2 today), so it queries row-by-row rather than pulling the
+// whole graph. A missing row for the referenced id is ErrSessionNotFound; a
+// missing ancestor stops the walk at the last existing id (a pruned parent
+// shouldn't blank the child's usage). The iteration bound guards a cyclic or
+// corrupt chain.
+func resolveRoot(ctx context.Context, db *sql.DB, id string) (string, error) {
+	root := id
+	for depth := 0; depth < maxParentWalkDepth; depth++ {
+		var parent sql.NullString
+		err := db.QueryRowContext(ctx, `SELECT parent_id FROM session WHERE id = ?`, root).Scan(&parent)
+		if errors.Is(err, sql.ErrNoRows) {
+			if root == id {
+				return "", fmt.Errorf("%w: %q", ErrSessionNotFound, id)
+			}
+			return root, nil
+		}
+		if err != nil {
+			return "", fmt.Errorf("resolving parent of session %q: %w", root, err)
+		}
+		if !parent.Valid || parent.String == "" {
+			return root, nil
+		}
+		root = parent.String
+	}
+	return root, nil
 }
 
 // defaultDBPath resolves opencode's standard data-dir location, honoring
