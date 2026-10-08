@@ -67,21 +67,25 @@ func (a *OpencodeAdapter) AgentType() string { return "opencode" }
 
 var _ usage.UsageAdapter = (*OpencodeAdapter)(nil)
 
-// PollUsage resolves ref (Kind == "id") and returns the session row's current
+// PollUsage resolves ref (Kind == "id") and returns the session tree's current
 // cumulative totals. The message table is never read; only the session row's
 // cost/token columns participate. NULL usage columns scan as zero (a fresh
 // session can legally hold NULL), and a missing session returns
 // ErrSessionNotFound. The returned SessionID is the authoritative id scanned
 // from the row itself — identical to ref.Value by primary key, but reported
 // from the source rather than echoed from the lookup key.
-func (a *OpencodeAdapter) PollUsage(ctx context.Context, ref usage.AgentSessionRef) (usage.UsageTotals, error) {
+//
+// Phase 1 seam note: this currently returns only the referenced row. Phase 2
+// resolves ref to its root and returns the whole parent_id subtree in one
+// recursive query.
+func (a *OpencodeAdapter) PollUsage(ctx context.Context, ref usage.AgentSessionRef) ([]usage.UsageTotals, error) {
 	if ref.Kind != snapshot.AgentSessionRefKindID {
-		return usage.UsageTotals{}, fmt.Errorf("%w: %q", ErrUnsupportedKind, ref.Kind)
+		return nil, fmt.Errorf("%w: %q", ErrUnsupportedKind, ref.Kind)
 	}
 
 	db, err := a.openReadOnly(ctx)
 	if err != nil {
-		return usage.UsageTotals{}, err
+		return nil, err
 	}
 	defer db.Close()
 
@@ -98,13 +102,13 @@ func (a *OpencodeAdapter) PollUsage(ctx context.Context, ref usage.AgentSessionR
 		FROM session WHERE id = ?`, ref.Value).
 		Scan(&id, &cost, &input, &output, &reasoning, &cacheRead, &cacheWrite)
 	if errors.Is(err, sql.ErrNoRows) {
-		return usage.UsageTotals{}, fmt.Errorf("%w: %q", ErrSessionNotFound, ref.Value)
+		return nil, fmt.Errorf("%w: %q", ErrSessionNotFound, ref.Value)
 	}
 	if err != nil {
-		return usage.UsageTotals{}, fmt.Errorf("querying session %q: %w", ref.Value, err)
+		return nil, fmt.Errorf("querying session %q: %w", ref.Value, err)
 	}
 
-	return usage.UsageTotals{
+	return []usage.UsageTotals{{
 		SessionID:        id,
 		CostUSD:          cost.Float64,
 		InputTokens:      input.Int64,
@@ -112,7 +116,7 @@ func (a *OpencodeAdapter) PollUsage(ctx context.Context, ref usage.AgentSessionR
 		ReasoningTokens:  reasoning.Int64,
 		CacheReadTokens:  cacheRead.Int64,
 		CacheWriteTokens: cacheWrite.Int64,
-	}, nil
+	}}, nil
 }
 
 // defaultDBPath resolves opencode's standard data-dir location, honoring

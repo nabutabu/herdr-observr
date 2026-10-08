@@ -27,18 +27,18 @@ var _ UsageAdapter = (*fakeSource)(nil)
 
 func (f *fakeSource) AgentType() string { return f.agentType }
 
-func (f *fakeSource) PollUsage(_ context.Context, ref AgentSessionRef) (UsageTotals, error) {
+func (f *fakeSource) PollUsage(_ context.Context, ref AgentSessionRef) ([]UsageTotals, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.calls++
 	if f.err != nil {
-		return UsageTotals{}, f.err
+		return nil, f.err
 	}
 	t, ok := f.totals[ref.Value]
 	if !ok {
-		return UsageTotals{}, fmt.Errorf("no totals for %q", ref.Value)
+		return nil, fmt.Errorf("no totals for %q", ref.Value)
 	}
-	return t, nil
+	return []UsageTotals{t}, nil
 }
 
 func (f *fakeSource) setTotals(v string, t UsageTotals) {

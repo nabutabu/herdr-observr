@@ -227,6 +227,9 @@ func TestPollUsageReturnsTotals(t *testing.T) {
 	if err != nil {
 		t.Fatalf("PollUsage: %v", err)
 	}
+	if len(got) != 1 {
+		t.Fatalf("PollUsage returned %d totals, want 1", len(got))
+	}
 
 	want := usage.UsageTotals{
 		SessionID:        "ses-1",
@@ -237,8 +240,8 @@ func TestPollUsageReturnsTotals(t *testing.T) {
 		CacheReadTokens:  5,
 		CacheWriteTokens: 2,
 	}
-	if got != want {
-		t.Errorf("PollUsage = %+v, want %+v", got, want)
+	if got[0] != want {
+		t.Errorf("PollUsage = %+v, want %+v", got[0], want)
 	}
 }
 
@@ -278,10 +281,13 @@ func TestPollUsageNullColumnsCoalesceToZero(t *testing.T) {
 	if err != nil {
 		t.Fatalf("PollUsage(NULL columns): %v", err)
 	}
+	if len(got) != 1 {
+		t.Fatalf("PollUsage returned %d totals, want 1", len(got))
+	}
 
 	want := usage.UsageTotals{SessionID: "ses-null"}
-	if got != want {
-		t.Errorf("PollUsage(NULL columns) = %+v, want %+v", got, want)
+	if got[0] != want {
+		t.Errorf("PollUsage(NULL columns) = %+v, want %+v", got[0], want)
 	}
 }
 

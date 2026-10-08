@@ -339,17 +339,18 @@ func (c *UsageCollector) pollPane(ctx context.Context, pane tracker.PaneState) {
 		Kind:   pane.AgentSession.Kind,
 		Value:  pane.AgentSession.Value,
 	}
-	totals, err := adapter.PollUsage(ctx, ref)
+	tree, err := adapter.PollUsage(ctx, ref)
 	if err != nil {
 		slog.Warn("polling usage failed; skipping", "pane_id", pane.PaneID, "error", err)
 		return
 	}
-	if totals.SessionID == "" {
-		slog.Warn("adapter returned empty session id; skipping", "pane_id", pane.PaneID, "ref_value", ref.Value)
-		return
+	for _, totals := range tree {
+		if totals.SessionID == "" {
+			slog.Warn("adapter returned empty session id; skipping", "pane_id", pane.PaneID, "ref_value", ref.Value)
+			continue
+		}
+		c.diffAndRecord(totals)
 	}
-
-	c.diffAndRecord(totals)
 }
 
 // diffAndRecord compares fresh totals against the last-observed totals for the
