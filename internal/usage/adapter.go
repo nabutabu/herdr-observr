@@ -35,6 +35,13 @@ type AgentSessionRef struct {
 // keyed by SessionID (never by pane, per the U-finding that agent_session is
 // frontmost-right-now, not a stable pane binding).
 //
+// PollUsage returns one UsageTotals per session in a session tree: the
+// referenced session's root plus every parent_id descendant, so a sub-session
+// (child) that never appears on Herdr's wire still accrues usage. ParentID is
+// the session's parent_id as reported by the source ("" for a root). It is
+// lifecycle metadata — an id, never content — so it stays inside the privacy
+// bar; the source's message/content tables are still never read.
+//
 // The token columns mirror the five cumulative counters opencode maintains on
 // its session row (tokens_input, tokens_output, tokens_reasoning,
 // tokens_cache_read, tokens_cache_write); the "total" counter exported at
@@ -42,6 +49,7 @@ type AgentSessionRef struct {
 // the source.
 type UsageTotals struct {
 	SessionID        string
+	ParentID         string // parent_id as reported by the source; "" for a root
 	CostUSD          float64
 	InputTokens      int64
 	OutputTokens     int64
@@ -60,9 +68,12 @@ type UsageTotals struct {
 // Fields are deltas by construction — never negative by design (a decrease is
 // treated as a source reset and re-seeds the cursor instead of emitting).
 // Attribution (which pane/workspace last pointed at the session) is a U3/U4
-// concern and deliberately absent here.
+// concern and deliberately absent here. ParentID is carried through from the
+// source totals ("" for a root) so U4 can tag child series and fall back to
+// the parent's attribution; it is lifecycle metadata (an id), not pane content.
 type UsageDelta struct {
 	SessionID        string
+	ParentID         string
 	CostUSD          float64
 	InputTokens      int64
 	OutputTokens     int64
@@ -81,8 +92,12 @@ type UsageAdapter interface {
 	AgentType() string
 
 	// PollUsage resolves ref according to its Kind and returns the source's
-	// current cumulative totals for that session, as reported by the source
-	// itself. The ref is the lookup key only; the returned SessionID is what
-	// any long-lived state is keyed by.
-	PollUsage(ctx context.Context, ref AgentSessionRef) (UsageTotals, error)
+	// current cumulative totals for that session *and its whole session tree*:
+	// the resolved root plus every parent_id descendant, one UsageTotals per
+	// session. Resolving up from the referenced session, rather than assuming
+	// ref points at the root, keeps polling correct regardless of which
+	// session the pane's frontmost agent_session names. The ref is the lookup
+	// key only; the returned SessionIDs are what any long-lived state is keyed
+	// by. A reference to a session with no row is ErrSessionNotFound.
+	PollUsage(ctx context.Context, ref AgentSessionRef) ([]UsageTotals, error)
 }

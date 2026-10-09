@@ -13,10 +13,12 @@ import (
 )
 
 // fixtureSchema mirrors the confirmed opencode.db session-table columns the
-// adapter reads (U0.1 spike): cost REAL plus the five cumulative token
-// counters. The real table has more columns; the adapter never selects them.
+// adapter reads (U0.1 spike + live schema check): parent_id TEXT plus cost REAL
+// and the five cumulative token counters. parent_id is nullable — NULL is a
+// root. The real table has more columns; the adapter never selects them.
 const fixtureSchema = `CREATE TABLE session (
     id                   TEXT PRIMARY KEY,
+    parent_id            TEXT,
     cost                 REAL,
     tokens_input         INTEGER,
     tokens_output        INTEGER,
@@ -227,6 +229,9 @@ func TestPollUsageReturnsTotals(t *testing.T) {
 	if err != nil {
 		t.Fatalf("PollUsage: %v", err)
 	}
+	if len(got) != 1 {
+		t.Fatalf("PollUsage returned %d totals, want 1", len(got))
+	}
 
 	want := usage.UsageTotals{
 		SessionID:        "ses-1",
@@ -237,8 +242,140 @@ func TestPollUsageReturnsTotals(t *testing.T) {
 		CacheReadTokens:  5,
 		CacheWriteTokens: 2,
 	}
-	if got != want {
-		t.Errorf("PollUsage = %+v, want %+v", got, want)
+	if got[0] != want {
+		t.Errorf("PollUsage = %+v, want %+v", got[0], want)
+	}
+}
+
+// insertSessionRow adds one session row to the fixture db at path. An empty
+// parentID inserts SQL NULL (a root), matching the real schema.
+func insertSessionRow(t *testing.T, path, id, parentID string, cost float64, in, out, reason, cacheRead, cacheWrite int64) {
+	t.Helper()
+	db, err := sql.Open("sqlite", "file:"+path)
+	if err != nil {
+		t.Fatalf("opening fixture db for insert: %v", err)
+	}
+	defer db.Close()
+	var parent any
+	if parentID != "" {
+		parent = parentID
+	}
+	if _, err := db.Exec(`INSERT INTO session
+		(id, parent_id, cost, tokens_input, tokens_output, tokens_reasoning, tokens_cache_read, tokens_cache_write)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`, id, parent, cost, in, out, reason, cacheRead, cacheWrite); err != nil {
+		t.Fatalf("inserting %s: %v", id, err)
+	}
+}
+
+func TestPollUsageReturnsWholeTree(t *testing.T) {
+	path := openFixtureDB(t) // ses-1 root: cost 0.42, in 100
+	insertSessionRow(t, path, "ses-child-a", "ses-1", 0.10, 10, 5, 1, 0, 0)
+	insertSessionRow(t, path, "ses-child-b", "ses-1", 0.20, 20, 8, 2, 0, 0)
+	insertSessionRow(t, path, "ses-grandchild", "ses-child-a", 0.30, 30, 9, 3, 0, 0)
+
+	a := New(path)
+	got, err := a.PollUsage(context.Background(), usage.AgentSessionRef{
+		Source: "herdr:opencode",
+		Kind:   snapshot.AgentSessionRefKindID,
+		Value:  "ses-1",
+	})
+	if err != nil {
+		t.Fatalf("PollUsage: %v", err)
+	}
+
+	byID := map[string]usage.UsageTotals{}
+	for _, tt := range got {
+		byID[tt.SessionID] = tt
+	}
+	if len(byID) != 4 {
+		t.Fatalf("tree size = %d, want 4 (%v)", len(byID), byID)
+	}
+	if byID["ses-1"].ParentID != "" {
+		t.Errorf("root ParentID = %q, want empty", byID["ses-1"].ParentID)
+	}
+	if byID["ses-child-a"].ParentID != "ses-1" || byID["ses-child-b"].ParentID != "ses-1" {
+		t.Errorf("children ParentID = %q/%q, want ses-1", byID["ses-child-a"].ParentID, byID["ses-child-b"].ParentID)
+	}
+	if byID["ses-grandchild"].ParentID != "ses-child-a" {
+		t.Errorf("grandchild ParentID = %q, want ses-child-a", byID["ses-grandchild"].ParentID)
+	}
+	if byID["ses-grandchild"].InputTokens != 30 {
+		t.Errorf("grandchild InputTokens = %d, want 30", byID["ses-grandchild"].InputTokens)
+	}
+}
+
+func TestPollUsageResolvesRootFromDescendant(t *testing.T) {
+	path := openFixtureDB(t)
+	insertSessionRow(t, path, "ses-child-a", "ses-1", 0.10, 10, 5, 1, 0, 0)
+	insertSessionRow(t, path, "ses-grandchild", "ses-child-a", 0.30, 30, 9, 3, 0, 0)
+
+	a := New(path)
+	// Reference a grandchild: the walk-up must reach ses-1 and the tree must
+	// include the sibling-less branch back down to the referenced session.
+	got, err := a.PollUsage(context.Background(), usage.AgentSessionRef{
+		Source: "herdr:opencode",
+		Kind:   snapshot.AgentSessionRefKindID,
+		Value:  "ses-grandchild",
+	})
+	if err != nil {
+		t.Fatalf("PollUsage: %v", err)
+	}
+	ids := map[string]bool{}
+	for _, tt := range got {
+		ids[tt.SessionID] = true
+	}
+	for _, want := range []string{"ses-1", "ses-child-a", "ses-grandchild"} {
+		if !ids[want] {
+			t.Errorf("tree missing %s; got %v", want, ids)
+		}
+	}
+}
+
+func TestPollUsageStopsAtMissingAncestor(t *testing.T) {
+	// A child whose parent row is gone is still returned (keyed under its
+	// existing-but-missing parent id), rather than failing the whole poll.
+	path := openFixtureDB(t)
+	insertSessionRow(t, path, "ses-orphan", "ses-missing", 0.5, 1, 2, 3, 4, 5)
+
+	a := New(path)
+	got, err := a.PollUsage(context.Background(), usage.AgentSessionRef{
+		Source: "herdr:opencode",
+		Kind:   snapshot.AgentSessionRefKindID,
+		Value:  "ses-orphan",
+	})
+	if err != nil {
+		t.Fatalf("PollUsage: %v", err)
+	}
+	if len(got) != 1 || got[0].SessionID != "ses-orphan" || got[0].ParentID != "ses-missing" {
+		t.Errorf("orphan tree = %+v, want just ses-orphan with parent ses-missing", got)
+	}
+}
+
+func TestPollUsageCyclicParentChainTerminates(t *testing.T) {
+	path := openFixtureDB(t)
+	db, err := sql.Open("sqlite", "file:"+path)
+	if err != nil {
+		t.Fatalf("opening fixture db: %v", err)
+	}
+	// Make the root its own parent: resolveRoot must bound out and the CTE's
+	// UNION must dedup, so the poll returns instead of hanging.
+	if _, err := db.Exec(`UPDATE session SET parent_id = 'ses-1' WHERE id = 'ses-1'`); err != nil {
+		db.Close()
+		t.Fatalf("creating cycle: %v", err)
+	}
+	db.Close()
+
+	a := New(path)
+	got, err := a.PollUsage(context.Background(), usage.AgentSessionRef{
+		Source: "herdr:opencode",
+		Kind:   snapshot.AgentSessionRefKindID,
+		Value:  "ses-1",
+	})
+	if err != nil {
+		t.Fatalf("PollUsage: %v", err)
+	}
+	if len(got) != 1 || got[0].SessionID != "ses-1" {
+		t.Errorf("cyclic tree = %+v, want just ses-1", got)
 	}
 }
 
@@ -278,10 +415,13 @@ func TestPollUsageNullColumnsCoalesceToZero(t *testing.T) {
 	if err != nil {
 		t.Fatalf("PollUsage(NULL columns): %v", err)
 	}
+	if len(got) != 1 {
+		t.Fatalf("PollUsage returned %d totals, want 1", len(got))
+	}
 
 	want := usage.UsageTotals{SessionID: "ses-null"}
-	if got != want {
-		t.Errorf("PollUsage(NULL columns) = %+v, want %+v", got, want)
+	if got[0] != want {
+		t.Errorf("PollUsage(NULL columns) = %+v, want %+v", got[0], want)
 	}
 }
 

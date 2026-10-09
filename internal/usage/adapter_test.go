@@ -15,8 +15,8 @@ type fakeAdapter struct {
 
 func (f *fakeAdapter) AgentType() string { return f.agentType }
 
-func (f *fakeAdapter) PollUsage(_ context.Context, ref AgentSessionRef) (UsageTotals, error) {
-	return UsageTotals{
+func (f *fakeAdapter) PollUsage(_ context.Context, ref AgentSessionRef) ([]UsageTotals, error) {
+	return []UsageTotals{{
 		SessionID:        ref.Value,
 		CostUSD:          0.42,
 		InputTokens:      100,
@@ -24,7 +24,7 @@ func (f *fakeAdapter) PollUsage(_ context.Context, ref AgentSessionRef) (UsageTo
 		ReasoningTokens:  10,
 		CacheReadTokens:  5,
 		CacheWriteTokens: 2,
-	}, nil
+	}}, nil
 }
 
 func TestAdapterRoundingTrip(t *testing.T) {
@@ -39,10 +39,14 @@ func TestAdapterRoundingTrip(t *testing.T) {
 		Value:  "ses_f4e33e375ffeyBBqhfPxBEhEmn",
 	}
 
-	totals, err := adapter.PollUsage(context.Background(), ref)
+	tree, err := adapter.PollUsage(context.Background(), ref)
 	if err != nil {
 		t.Fatalf("PollUsage: %v", err)
 	}
+	if len(tree) != 1 {
+		t.Fatalf("PollUsage returned %d totals, want 1", len(tree))
+	}
+	totals := tree[0]
 	if totals.SessionID != ref.Value {
 		t.Errorf("SessionID = %q, want ref.Value %q", totals.SessionID, ref.Value)
 	}
@@ -66,11 +70,11 @@ func TestPathKindRefIsViableLookupKey(t *testing.T) {
 		Kind:   snapshot.AgentSessionRefKindPath,
 		Value:  "/home/user/.local/share/opencode/session-1",
 	}
-	totals, err := (&fakeAdapter{}).PollUsage(context.Background(), ref)
+	tree, err := (&fakeAdapter{}).PollUsage(context.Background(), ref)
 	if err != nil {
 		t.Fatalf("PollUsage: %v", err)
 	}
-	if totals.SessionID == "" {
+	if len(tree) == 0 || tree[0].SessionID == "" {
 		t.Error("adapter returned empty SessionID for a path-kind ref")
 	}
 }

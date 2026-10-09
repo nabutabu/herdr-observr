@@ -435,6 +435,7 @@ func TestUsageMetricsRegistersAndIncrements(t *testing.T) {
 
 	attrs := []attribute.KeyValue{
 		attribute.String(SessionIDKey, "ses_1"),
+		attribute.String(ParentIDKey, "ses_root"),
 		attribute.String(PaneIDKey, "w1:p1"),
 		attribute.String(WorkspaceIDKey, "w1"),
 		attribute.String(AgentTypeKey, "opencode"),
@@ -518,6 +519,7 @@ func checkUsageAttrs(t *testing.T, set attribute.Set) {
 	t.Helper()
 	for key, want := range map[attribute.Key]string{
 		attribute.Key(SessionIDKey):   "ses_1",
+		attribute.Key(ParentIDKey):    "ses_root",
 		attribute.Key(PaneIDKey):      "w1:p1",
 		attribute.Key(WorkspaceIDKey): "w1",
 		attribute.Key(AgentTypeKey):   "opencode",

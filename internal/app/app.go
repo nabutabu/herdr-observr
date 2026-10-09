@@ -175,10 +175,11 @@ func (a *App) Run(ctx context.Context) error {
 			// U4.1: export each accrued usage delta across the
 			// herdr.session.* counters, tagged with the session id and its
 			// last-known pane/workspace/agent location from the tracker's
-			// session→attribution index (U3.2; miss → untagged). Read on the
-			// event-loop goroutine; Sessions() takes an RLock shallow copy, so
-			// tracker single-writer discipline is intact.
-			a.telemetry.recordUsageDelta(d, a.tr.Sessions()[d.SessionID])
+			// session→attribution index (U3.2). Sub-sessions fall back to the
+			// parent's location; both miss → untagged. Read on the event-loop
+			// goroutine; Sessions() takes an RLock shallow copy, so tracker
+			// single-writer discipline is intact.
+			a.telemetry.recordUsageDelta(d, a.resolveSessionAttribution(d))
 			slog.Debug("usage delta", "session_id", d.SessionID, "cost_usd", d.CostUSD,
 				"input_tokens", d.InputTokens, "output_tokens", d.OutputTokens)
 
@@ -203,6 +204,25 @@ func (a *App) Run(ctx context.Context) error {
 			return nil
 		}
 	}
+}
+
+// resolveSessionAttribution resolves a usage delta's last-known pane/workspace/
+// agent location from the tracker's session→attribution index (U3.2). A
+// sub-session never appears in that index (children are wire-invisible, so no
+// pane's agent_session ever points at one), so on a miss it falls back to the
+// parent's attribution — letting child series inherit their root's location.
+// Both misses yield the zero attribution, which recordUsageDelta exports
+// untagged. Reads only the tracker's RLock shallow copy; call on the event-loop
+// goroutine so tracker single-writer discipline holds.
+func (a *App) resolveSessionAttribution(d usage.UsageDelta) tracker.SessionAttribution {
+	sessions := a.tr.Sessions()
+	if att, ok := sessions[d.SessionID]; ok {
+		return att
+	}
+	if d.ParentID != "" {
+		return sessions[d.ParentID]
+	}
+	return tracker.SessionAttribution{}
 }
 
 // handleEvent routes a normalized event to the tracker handler for its kind.

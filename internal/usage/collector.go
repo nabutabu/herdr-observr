@@ -310,10 +310,13 @@ func (c *UsageCollector) pollPaneInMap(ctx context.Context, paneID string, panes
 	c.pollPane(ctx, pane)
 }
 
-// pollPane fetches one pane's session totals and diffs them against the
-// cursor. Pane-level skips (no agent_session, no adapter, gracing pane) are
-// accepted gaps — the plan's design says panes without a session attribution
-// get no usage tracking, not silently degraded to a heuristic.
+// pollPane fetches one pane's session tree and diffs every entry against its
+// cursor. The adapter returns the referenced session's root plus its parent_id
+// descendants, so sub-sessions that never appear on the wire still accrue. Each
+// entry is keyed by its own SessionID in diffAndRecord, so a child gets an
+// independent cursor. Pane-level skips (no agent_session, no adapter, gracing
+// pane) are accepted gaps — panes without a session attribution get no usage
+// tracking, not silently degraded to a heuristic.
 func (c *UsageCollector) pollPane(ctx context.Context, pane tracker.PaneState) {
 	if !pane.ClosedAt.IsZero() {
 		return // in close grace window (2.7): not a live pane, don't poll
@@ -339,22 +342,25 @@ func (c *UsageCollector) pollPane(ctx context.Context, pane tracker.PaneState) {
 		Kind:   pane.AgentSession.Kind,
 		Value:  pane.AgentSession.Value,
 	}
-	totals, err := adapter.PollUsage(ctx, ref)
+	tree, err := adapter.PollUsage(ctx, ref)
 	if err != nil {
 		slog.Warn("polling usage failed; skipping", "pane_id", pane.PaneID, "error", err)
 		return
 	}
-	if totals.SessionID == "" {
-		slog.Warn("adapter returned empty session id; skipping", "pane_id", pane.PaneID, "ref_value", ref.Value)
-		return
+	for _, totals := range tree {
+		if totals.SessionID == "" {
+			slog.Warn("adapter returned empty session id; skipping", "pane_id", pane.PaneID, "ref_value", ref.Value)
+			continue
+		}
+		c.diffAndRecord(totals)
 	}
-
-	c.diffAndRecord(totals)
 }
 
 // diffAndRecord compares fresh totals against the last-observed totals for the
 // session and emits the accrued delta. The cursor is keyed by the adapter's
-// reported SessionID, never by the ref's Value lookup key.
+// reported SessionID, never by the ref's Value lookup key. Because cursors are
+// per-session, each session in a polled tree has its own cursor and gets the
+// silent first-seed / negative-diff re-seed treatment independently.
 func (c *UsageCollector) diffAndRecord(totals UsageTotals) {
 	prev, seen := c.cursors[totals.SessionID]
 	if !seen {
@@ -387,6 +393,7 @@ func (c *UsageCollector) diffAndRecord(totals UsageTotals) {
 func diffTotals(prev, cur UsageTotals) UsageDelta {
 	return UsageDelta{
 		SessionID:        cur.SessionID,
+		ParentID:         cur.ParentID,
 		CostUSD:          cur.CostUSD - prev.CostUSD,
 		InputTokens:      cur.InputTokens - prev.InputTokens,
 		OutputTokens:     cur.OutputTokens - prev.OutputTokens,
@@ -408,7 +415,7 @@ func anyNegative(d UsageDelta) bool {
 }
 
 // usageDeltaZero reports whether a delta carries no accrued usage at all,
-// ignoring the SessionID field (which is identity, not an amount).
+// ignoring the identity fields SessionID/ParentID (which are not amounts).
 func usageDeltaZero(d UsageDelta) bool {
 	return d.CostUSD == 0 &&
 		d.InputTokens == 0 &&

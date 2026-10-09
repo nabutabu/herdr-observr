@@ -19,6 +19,7 @@ type fakeSource struct {
 
 	mu     sync.Mutex
 	totals map[string]UsageTotals
+	trees  map[string][]UsageTotals
 	err    error
 	calls  int
 }
@@ -27,18 +28,21 @@ var _ UsageAdapter = (*fakeSource)(nil)
 
 func (f *fakeSource) AgentType() string { return f.agentType }
 
-func (f *fakeSource) PollUsage(_ context.Context, ref AgentSessionRef) (UsageTotals, error) {
+func (f *fakeSource) PollUsage(_ context.Context, ref AgentSessionRef) ([]UsageTotals, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.calls++
 	if f.err != nil {
-		return UsageTotals{}, f.err
+		return nil, f.err
+	}
+	if tree, ok := f.trees[ref.Value]; ok {
+		return append([]UsageTotals(nil), tree...), nil
 	}
 	t, ok := f.totals[ref.Value]
 	if !ok {
-		return UsageTotals{}, fmt.Errorf("no totals for %q", ref.Value)
+		return nil, fmt.Errorf("no totals for %q", ref.Value)
 	}
-	return t, nil
+	return []UsageTotals{t}, nil
 }
 
 func (f *fakeSource) setTotals(v string, t UsageTotals) {
@@ -48,6 +52,17 @@ func (f *fakeSource) setTotals(v string, t UsageTotals) {
 		f.totals = map[string]UsageTotals{}
 	}
 	f.totals[v] = t
+}
+
+// setTree makes PollUsage return a full session tree for ref v (root plus
+// descendants), overriding any single-totals entry for the same ref.
+func (f *fakeSource) setTree(v string, tree ...UsageTotals) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.trees == nil {
+		f.trees = map[string][]UsageTotals{}
+	}
+	f.trees[v] = tree
 }
 
 func (f *fakeSource) setErr(err error) {
@@ -172,6 +187,9 @@ func assertDeltaEqual(t *testing.T, got, want UsageDelta) {
 	t.Helper()
 	if got.SessionID != want.SessionID {
 		t.Errorf("SessionID = %q, want %q", got.SessionID, want.SessionID)
+	}
+	if got.ParentID != want.ParentID {
+		t.Errorf("ParentID = %q, want %q", got.ParentID, want.ParentID)
 	}
 	if !approx(got.CostUSD, want.CostUSD) {
 		t.Errorf("CostUSD = %v, want %v", got.CostUSD, want.CostUSD)
@@ -371,6 +389,116 @@ func TestCollectorDecreaseReseedsCursor(t *testing.T) {
 	}
 	if got[0].InputTokens != 10 || got[0].CostUSD != 0 {
 		t.Errorf("post-reset delta = %+v, want input 10 cost 0", got[0])
+	}
+}
+
+func TestCollectorChildSessionsGetIndependentCursors(t *testing.T) {
+	src := &fakeSource{agentType: "opencode"}
+	src.setTree("ses-root",
+		UsageTotals{SessionID: "ses-root", CostUSD: 1, InputTokens: 100},
+		UsageTotals{SessionID: "ses-child", ParentID: "ses-root", CostUSD: 0.5, InputTokens: 40},
+	)
+
+	c := NewUsageCollector(func() map[string]tracker.PaneState {
+		return map[string]tracker.PaneState{"w1:p1": agentPane("w1:p1", "opencode", "herdr:opencode", "ses-root")}
+	}, src)
+
+	// First poll seeds every session in the tree silently — including the child.
+	// A child's first sighting must not fabricate its cumulative total.
+	pollPaneID(c, context.Background(), "w1:p1")
+	if got := drainDeltas(c); len(got) != 0 {
+		t.Fatalf("first tree poll emitted deltas, want seed-only: %+v", got)
+	}
+
+	// Both accrue independently; each emits its own delta keyed by its own id.
+	src.setTree("ses-root",
+		UsageTotals{SessionID: "ses-root", CostUSD: 1.1, InputTokens: 110},
+		UsageTotals{SessionID: "ses-child", ParentID: "ses-root", CostUSD: 0.9, InputTokens: 55},
+	)
+	pollPaneID(c, context.Background(), "w1:p1")
+
+	byID := map[string]UsageDelta{}
+	for _, d := range drainDeltas(c) {
+		byID[d.SessionID] = d
+	}
+	if len(byID) != 2 {
+		t.Fatalf("emitted %d deltas, want 2 (root + child): %+v", len(byID), byID)
+	}
+	if got := byID["ses-root"]; got.InputTokens != 10 || got.ParentID != "" {
+		t.Errorf("root delta = %+v, want input 10, empty parent", got)
+	}
+	if got := byID["ses-child"]; got.InputTokens != 15 || got.ParentID != "ses-root" {
+		t.Errorf("child delta = %+v, want input 15, parent ses-root", got)
+	}
+}
+
+func TestCollectorChildReseedIndependentOfRoot(t *testing.T) {
+	src := &fakeSource{agentType: "opencode"}
+	src.setTree("ses-root",
+		UsageTotals{SessionID: "ses-root", InputTokens: 100},
+		UsageTotals{SessionID: "ses-child", ParentID: "ses-root", InputTokens: 40},
+	)
+	c := NewUsageCollector(func() map[string]tracker.PaneState {
+		return map[string]tracker.PaneState{"w1:p1": agentPane("w1:p1", "opencode", "herdr:opencode", "ses-root")}
+	}, src)
+	pollPaneID(c, context.Background(), "w1:p1") // seed both
+
+	// Root accrues; child drops below its cursor (source reset). The child
+	// re-seeds silently while the root still emits.
+	src.setTree("ses-root",
+		UsageTotals{SessionID: "ses-root", InputTokens: 150},
+		UsageTotals{SessionID: "ses-child", ParentID: "ses-root", InputTokens: 5},
+	)
+	pollPaneID(c, context.Background(), "w1:p1")
+	got := drainDeltas(c)
+	if len(got) != 1 || got[0].SessionID != "ses-root" || got[0].InputTokens != 50 {
+		t.Fatalf("deltas = %+v, want only root input 50 (child re-seeds silently)", got)
+	}
+
+	// Child accrues from its new baseline; root unchanged.
+	src.setTree("ses-root",
+		UsageTotals{SessionID: "ses-root", InputTokens: 150},
+		UsageTotals{SessionID: "ses-child", ParentID: "ses-root", InputTokens: 12},
+	)
+	pollPaneID(c, context.Background(), "w1:p1")
+	got = drainDeltas(c)
+	if len(got) != 1 || got[0].SessionID != "ses-child" || got[0].InputTokens != 7 || got[0].ParentID != "ses-root" {
+		t.Fatalf("deltas = %+v, want only child input 7", got)
+	}
+}
+
+func TestCollectorAdapterErrorKeepsChildCursors(t *testing.T) {
+	src := &fakeSource{agentType: "opencode"}
+	src.setTree("ses-root",
+		UsageTotals{SessionID: "ses-root", InputTokens: 100},
+		UsageTotals{SessionID: "ses-child", ParentID: "ses-root", InputTokens: 40},
+	)
+	c := NewUsageCollector(func() map[string]tracker.PaneState {
+		return map[string]tracker.PaneState{"w1:p1": agentPane("w1:p1", "opencode", "herdr:opencode", "ses-root")}
+	}, src)
+	pollPaneID(c, context.Background(), "w1:p1") // seed both
+
+	src.setErr(errors.New("source unavailable"))
+	pollPaneID(c, context.Background(), "w1:p1")
+	if got := drainDeltas(c); len(got) != 0 {
+		t.Errorf("errored tree poll emitted deltas: %+v", got)
+	}
+
+	// Recovery: both cursors survived, so each reports accrual since the seed
+	// baseline, not since the errored poll.
+	src.setErr(nil)
+	src.setTree("ses-root",
+		UsageTotals{SessionID: "ses-root", InputTokens: 130},
+		UsageTotals{SessionID: "ses-child", ParentID: "ses-root", InputTokens: 70},
+	)
+	pollPaneID(c, context.Background(), "w1:p1")
+
+	byID := map[string]UsageDelta{}
+	for _, d := range drainDeltas(c) {
+		byID[d.SessionID] = d
+	}
+	if len(byID) != 2 || byID["ses-root"].InputTokens != 30 || byID["ses-child"].InputTokens != 30 {
+		t.Fatalf("recovery deltas = %+v, want root 30 and child 30", byID)
 	}
 }
 
