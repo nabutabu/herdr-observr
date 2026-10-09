@@ -12,6 +12,9 @@ lifecycle/state metadata (ids, states, timestamps) and aggregated usage numbers
 (session ids, token/cost counters) leave the process, never pane/terminal
 content or agent transcripts.
 
+Generated with assistance from opencode [BigPickle] and Claude Sonnet 5.5, 
+reviewed and refactored by @nabutabu.
+
 ## Requirements
 
 - Go 1.26+
